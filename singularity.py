@@ -10,6 +10,7 @@ import subprocess
 import threading
 import socket
 import shutil
+import shlex
 from core.status_manager import update_status, clear_all_statuses
 from pathlib import Path
 from datetime import datetime
@@ -227,7 +228,7 @@ def _submenu_extras():
             # Lite: sin Chaos Maker (corrompe MKVs a propósito, solo sirve para
             # probar el rescatador, que aquí no existe). CSI sube al 4.4.
             "  [bold cyan][4.1][/bold cyan]  Ingestor de Tags\n"
-            "  [bold cyan][4.2][/bold cyan]  Comparador de Torrents\n"
+            "  [bold cyan][4.2][/bold cyan]  Checkit — forense de torrents\n"
             "  [bold cyan][4.3][/bold cyan]  Triaje MKV (HEVC vs H264)\n"
             "  [bold cyan][4.4][/bold cyan]  CSI: Check, Search, Identify\n"
             "  [bold cyan][0][/bold cyan]    Atrás\n",
@@ -248,7 +249,18 @@ def _submenu_extras():
         elif sub == "4.2":
             script = BASE_DIR / "extras" / "torrents comparison" / "checkit.py"
             if script.exists():
-                _run(["python3", str(script)], cwd=script.parent)
+                console.print(Panel(
+                    "\n"
+                    "  • un [bold].torrent[/bold] → su ficha completa\n"
+                    "  • varios separados por espacios → comparación forense\n"
+                    "  • una [bold]carpeta[/bold] → índice de duplicados y contenido repetido\n",
+                    title="[bold blue]Checkit — forense de torrents[/bold blue]",
+                    border_style="blue",
+                ))
+                raw = Prompt.ask("[bold]Ruta a analizar[/bold]").strip()
+                if raw:
+                    _run(["python3", str(script), *shlex.split(raw)], cwd=script.parent)
+                    Prompt.ask("Pulsa Enter para seguir", default="")
             else:
                 console.print("[yellow]⚠ No encuentro el script extras/torrents comparison/checkit.py.[/yellow]")
                 Prompt.ask("Pulsa Enter para seguir", default="")
