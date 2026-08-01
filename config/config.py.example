@@ -710,10 +710,22 @@ config = {'AUTO': {'delay': 0, 'description_folder': None, 'dupe_similarity': 80
                      'signature': '\n'
                                   '[center][b]PLEASE SEED YU-SCENE FAMILY[/b][/center]\n'
                                   '[center][url=https://codeberg.org/RawSmoke/Singularity][img=400]https://i.ibb.co/2NVWb0c/uploadrr.webp[/img][/url][/center]'}},
+ # Este es el bloque que lee la Aduana (RawLoadrr/rawncher.py:113), NO el
+ # 'qbit' de dentro de TORRENT_CLIENTS. Dos detalles que importan:
+ #
+ #  1. 'qbit_user' TIENE que ser el literal 'YOUR_USERNAME'. El asistente
+ #     decide si preguntarte la config comparando contra esa cadena exacta.
+ #     Con cualquier otro valor el asistente no se lanza en una instalación
+ #     nueva, y el handshake falla contra credenciales de plantilla.
+ #
+ #  2. 'qbit_url' va SIN puerto. El puerto se pasa aparte en 'qbit_port'.
+ #     Si lo pones en los dos sitios sale http://127.0.0.1:8888:8888 y no
+ #     conecta. Vale lo mismo cuando el asistente te pregunte: en "URL del
+ #     Cliente" va solo el host, el puerto es la pregunta siguiente.
  'qbit': {'enable_search': True,
           'qbit_pass': 'PASSWORD',
           'qbit_port': '8888',
-          'qbit_url': 'http://127.0.0.1:8888',
-          'qbit_user': 'USERNAME',
+          'qbit_url': 'http://127.0.0.1',
+          'qbit_user': 'YOUR_USERNAME',
           'torrent_storage_dir': '/app/RawLoadrr/qbit_backup'},
  'version': '1.0.7'}
