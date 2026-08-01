@@ -11,7 +11,11 @@ from datetime import datetime
 
 LEGACY_CODECS      = frozenset({"mpeg4", "xvid", "divx", "msmpeg4", "wmv1", "wmv2", "mpeg2video"})
 GOOD_CODECS        = frozenset({"h264", "hevc"})   # únicos codecs que no necesitan transcode
-BAD_SUB_CODECS     = frozenset({"webvtt"})          # subs que rompen tdarr → convertir a SRT o fusillar
+BAD_SUB_CODECS     = frozenset({"webvtt"})          # subs que rompen tdarr → convertir a SRT o fusillar (SOLO triage)
+# Subs de TEXTO que sí prometemos preservar en un rescate: convertibles a SRT sin OCR.
+# Todo lo demás (imagen: dvd_subtitle/PGS/DVB; binarios; webvtt) es descartable:
+# si bloquea el encode se tira, y perderlo NO es un fallo de validación.
+PORTABLE_SUB_CODECS = frozenset({"subrip", "srt", "ass", "ssa", "mov_text", "text"})
 SUSPICIOUS_SIZE_MB = 1
 
 class Verifier:
@@ -151,12 +155,14 @@ class Verifier:
 
         t_orig = self._count_tracks_ffprobe(meta_orig)
         t_new = self._count_tracks_ffprobe(meta_new)
-        # Subs: excluimos WebVTT del conteo original — se convierten a SRT o se fusillan
-        orig_valid_subs = self._count_valid_subtitle_tracks(meta_orig)
+        # Subs: solo exigimos preservar los de TEXTO (convertibles a SRT). Los de
+        # imagen/binarios son tóxicos: si bloquean el encode se descartan y perderlos
+        # NO es un fallo. Ver PORTABLE_SUB_CODECS.
+        orig_required_subs = self._count_required_subtitle_tracks(meta_orig)
 
         if t_new['video'] < t_orig['video']: report["errors"].append("VIDEO_TRACK_LOST")
         if t_new['audio'] < t_orig['audio']: report["errors"].append("AUDIO_TRACK_LOST")
-        if t_new['subtitle'] < orig_valid_subs: report["errors"].append("SUBTITLE_TRACK_LOST")
+        if t_new['subtitle'] < orig_required_subs: report["errors"].append("SUBTITLE_TRACK_LOST")
 
         dur_orig = float(meta_orig['format'].get('duration', 0)) if meta_orig else 0
         dur_new = float(meta_new['format'].get('duration', 0)) if meta_new else 0
@@ -202,13 +208,15 @@ class Verifier:
                 if ctype in tracks: tracks[ctype] += 1
         return tracks
 
-    def _count_valid_subtitle_tracks(self, meta):
-        """Cuenta subtítulos excluyendo codecs que se convierten/fusillan intencionalmente (WebVTT)."""
+    def _count_required_subtitle_tracks(self, meta):
+        """Cuenta SOLO los subtítulos de texto (PORTABLE_SUB_CODECS) que sí prometemos
+        preservar. Los de imagen/binarios (dvd_subtitle, PGS, DVB...) y WebVTT no se
+        cuentan: su pérdida es aceptable porque no se pueden pasar a SRT."""
         count = 0
         if meta:
             for s in meta.get('streams', []):
                 if (s.get('codec_type') == 'subtitle' and
-                        s.get('codec_name', '').lower() not in BAD_SUB_CODECS):
+                        s.get('codec_name', '').lower() in PORTABLE_SUB_CODECS):
                     count += 1
         return count
 

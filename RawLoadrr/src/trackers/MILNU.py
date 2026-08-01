@@ -29,16 +29,16 @@ class MILNU():
             else:
                 return '4'
         category_id = {
-            'MOVIE': '0',
-            'TV': '1',
+            'MOVIE': '1',
+            'TV': '2',
             'MUSIC': '5',
             'VHS': '7',
             'ANIME_CA': '8',
             'DOCUMENTARY': '9',
             'LATINO': '10',
-            'MANGA': '11',
-            'BOOK': '12',
-            'COMIC': '13',
+            'MANGA': '6',
+            'BOOK': '11',
+            'COMIC': '12',
         }.get(category_name, '0')
         return category_id
 

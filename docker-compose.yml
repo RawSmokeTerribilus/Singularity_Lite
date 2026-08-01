@@ -1,53 +1,84 @@
+# Singularity Lite — compose for low-power hosts (Raspberry Pi, NAS, mini-PC).
+#
+# There is no published image: this builds from the Dockerfile beside it.
+# Run `make install` (or ./final-user-install.sh) BEFORE the first `up` — it
+# creates the config and work_data files that the file-mounts below expect.
+# Skipping it is the single most common way to break this stack; see the note
+# above the WORK DATA block.
+#
+# Two separate env files, and they are not interchangeable:
+#   ./.env        -> read by DOCKER COMPOSE for ${...} interpolation below
+#                    (PUID/PGID/TZ/MEDIA_ROOT). Compose does NOT interpolate
+#                    from `env_file:`, only from the project-root .env.
+#   ./config/.env -> read by the APPLICATION inside the container (tracker
+#                    cookies, API keys, ME_* namespace, paths).
+
 services:
   singularity:
     build:
       context: .
       dockerfile: Dockerfile
-    platform: linux/arm64
     container_name: singularity_core
     restart: unless-stopped
     user: "${PUID:-1000}:${PGID:-1000}"
     env_file: ./config/.env
     command: python3 -m core.dashboard
     environment:
-      - TZ=Europe/Madrid
+      - TZ=${TZ:-Etc/UTC}
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
-    deploy:
-      resources:
-        limits:
-          memory: 2G
+
+    # No privileged, no devices, no group_add, no LIBVA_DRIVER_NAME.
+    # Lite never touches a GPU: no VAAPI, no transcoding, no framebuffer.
+    #
+    # No cpus/memory limits by default either — on a 2-4 GB box an artificial
+    # cap mostly just hides OOM. Set them here if you have a reason to.
+
     volumes:
       # --- 1. CONFIGURACIÓN ---
-      - ./config/.env:/app/.env:z
-      - ./config/singularity_config.py:/app/singularity_config.py:z
-      - ./config/config.py:/app/RawLoadrr/data/config.py:z
-      - ./config/mass_config.py:/app/extras/MASS-EDITION-UNIT3D/config.py:z
+      # Individual FILE mounts. If the host-side file does not exist, Docker
+      # creates a DIRECTORY in its place and the module fails with a confusing
+      # IsADirectoryError. The installer touch()es all of them; the preflight
+      # check in core/preflight.py catches it if something slips through.
+      - ./config/.env:/app/.env
+      - ./config/singularity_config.py:/app/singularity_config.py
+      - ./config/config.py:/app/RawLoadrr/data/config.py
+      - ./config/mass_config.py:/app/extras/MASS-EDITION-UNIT3D/config.py
 
       # --- 2. WORK DATA & PERSISTENCIA ---
-      - ./work_data/mass_editor/ids.txt:/app/extras/MASS-EDITION-UNIT3D/ids.txt:z
-      - ./work_data/mass_editor/completados.txt:/app/extras/MASS-EDITION-UNIT3D/completados.txt:z
-      - ./work_data/mass_editor/completados_img.txt:/app/extras/MASS-EDITION-UNIT3D/completados_img.txt:z
-      - ./work_data/mass_editor/mapeo_maestro.json:/app/extras/MASS-EDITION-UNIT3D/mapeo_maestro.json:z
-      - ./work_data/mass_editor/titulos_mapa.json:/app/extras/MASS-EDITION-UNIT3D/titulos_mapa.json:z
-      - ./work_data/mass_editor/mapeo_por_titulo.json:/app/extras/MASS-EDITION-UNIT3D/mapeo_por_titulo.json:z
-      - ./work_data/tmp:/app/RawLoadrr/tmp:z
-      - ./work_data/logs:/app/logs:z
-      - ./work_data/reports:/app/MKVerything/docs:z
-      - ./work_data/trackers:/app/RawLoadrr/src/trackers:z
-      - ./work_data/reports:/app/work_data/reports:z
+      # These six are the mass-editor's entire state. Omitting them is what made
+      # the editor "forget" its IDs and re-scrape nothing: the container then
+      # reads its own writable layer instead of the host, so deleting the host
+      # files changes nothing and a recreate loses everything.
+      - ./work_data/mass_editor/ids.txt:/app/extras/MASS-EDITION-UNIT3D/ids.txt
+      - ./work_data/mass_editor/completados.txt:/app/extras/MASS-EDITION-UNIT3D/completados.txt
+      - ./work_data/mass_editor/completados_img.txt:/app/extras/MASS-EDITION-UNIT3D/completados_img.txt
+      - ./work_data/mass_editor/mapeo_maestro.json:/app/extras/MASS-EDITION-UNIT3D/mapeo_maestro.json
+      - ./work_data/mass_editor/titulos_mapa.json:/app/extras/MASS-EDITION-UNIT3D/titulos_mapa.json
+      - ./work_data/mass_editor/mapeo_por_titulo.json:/app/extras/MASS-EDITION-UNIT3D/mapeo_por_titulo.json
+      - ./work_data/tmp:/app/RawLoadrr/tmp
+      - ./work_data/logs:/app/logs
+      - ./work_data/reports:/app/MKVerything/docs
+      - ./work_data/reports:/app/work_data/reports
+      - ./work_data/trackers:/app/RawLoadrr/src/trackers
 
       # --- 3. PERSISTENCIA DE MÓDULOS ---
-      - ./work_data/logs/csi_log:/app/extras/CSI/csi_log:z
-      - ./work_data/cookies:/app/RawLoadrr/data/cookies:z
-      - ./work_data/logs/rawloadrr:/app/RawLoadrr/logs:z
-      - ./work_data/logs/mkverything:/app/MKVerything/logs:z
-      - ./work_data/qbit_backup:/app/RawLoadrr/qbit_backup:z
+      - ./work_data/logs/csi_log:/app/extras/CSI/csi_log
+      - ./work_data/cookies:/app/RawLoadrr/data/cookies
+      - ./work_data/logs/rawloadrr:/app/RawLoadrr/logs
+      - ./work_data/logs/mkverything:/app/MKVerything/logs
+      - ./work_data/qbit_backup:/app/RawLoadrr/qbit_backup
 
-      # --- 4. EL ARSENAL ---
-      - /mnt/armagedon_data/data:/data:z
-      - /mnt/armagedon/data:/cfg_data:z
+      # --- 4. TU BIBLIOTECA ---
+      # Mounted at the SAME path inside and out, so paths you type in the TUI,
+      # and paths your *arr stack already knows, both resolve unchanged.
+      # Set MEDIA_ROOT in ./.env — e.g. /mnt/media, /volume1/data, /srv/storage.
+      # Add more lines in the same shape if your library spans several mounts.
+      - ${MEDIA_ROOT:?set MEDIA_ROOT in ./.env — see .env.example}:${MEDIA_ROOT}
 
+    # No :z here. SELinux relabelling is a no-op on Debian/Raspberry Pi OS and
+    # on most NAS firmware; on the maintainer's RHEL box a :z relabel once
+    # tagged $HOME container_file_t and broke fail2ban and firewalld.
     network_mode: host
     stdin_open: true
     tty: true

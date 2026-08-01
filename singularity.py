@@ -170,25 +170,25 @@ def _submenu_mkverything():
         console.print()
         console.print(Panel(
             "\n"
-            "  [bold cyan][1.1][/bold cyan]  Lanzador (todos los modos)\n"
+            "  [bold cyan][1.1][/bold cyan]  Auditoría de campo\n"
             "  [bold cyan][1.2][/bold cyan]  Ajustes / Dependencias\n"
             "  [bold cyan][1.3][/bold cyan]  Testeo rápido de herramientas\n"
-            "  [bold cyan][b][/bold cyan]    Atrás\n",
+            "  [bold cyan][0][/bold cyan]    Atrás\n",
             title="[bold green]MKVerything[/bold green]",
             border_style="green",
         ))
-        sub = Prompt.ask("root@singularidad:mkve", choices=["1.1", "1.2", "1.3", "b"], default="1.1")
+        sub = Prompt.ask("root@singularidad:mkve", choices=["1.1", "1.2", "1.3", "0"], default="1.1")
         log.info(f"MKVerything submenu: {sub}")
 
         if sub == "1.1":
             _run(["python3", "MKVerything/launcher.py"])
         elif sub == "1.2":
             console.print(Panel(
-                "  Necesitas estas dependencias binarias:\n"
-                "  [cyan]ffmpeg[/cyan]  [cyan]ffprobe[/cyan]  [cyan]makemkvcon[/cyan]  "
+                "  Dependencias binarias en Lite:\n"
+                "  [cyan]ffmpeg[/cyan]  [cyan]ffprobe[/cyan]  "
                 "[cyan]mkvmerge[/cyan]  [cyan]mediainfo[/cyan]\n\n"
-                "  Déjalos en [bold]MKVerything/bin/linux/[/bold]\n"
-                "  Python deps: [bold]pip install -r MKVerything/requirements.txt[/bold]",
+                "  Vienen ya en la imagen (apt). No hace falta tocar nada.\n"
+                "  [dim]makemkvcon no está: solo hay binarios x86_64 y Lite no ripea ISOs.[/dim]",
                 title="[bold yellow]Ajustes de MKVerything[/bold yellow]",
                 border_style="yellow",
             ))
@@ -198,7 +198,7 @@ def _submenu_mkverything():
             console.print()
             console.print(Rule("[bold]Testeo de herramientas[/bold]"))
             all_ok = True
-            for tool in ["ffmpeg", "ffprobe", "mkvmerge", "mediainfo", "makemkvcon"]:
+            for tool in ["ffmpeg", "ffprobe", "mkvmerge", "mediainfo"]:
                 rc = subprocess.run(["which", tool], capture_output=True).returncode
                 status = "[green]✓ Fetén[/green]" if rc == 0 else "[red]✗ Ni rastro[/red]"
                 if rc != 0:
@@ -208,10 +208,10 @@ def _submenu_mkverything():
             if all_ok:
                 console.print("[green]✓ Todas las herramientas están a punto.[/green]")
             else:
-                console.print("[yellow]⚠ Faltan herramientas. Ajusta la carpeta MKVerything/bin/linux/ y el PATH.[/yellow]")
+                console.print("[yellow]⚠ Faltan herramientas. La imagen debería traerlas: reconstruye con 'make build'.[/yellow]")
             log.info(f"Tool test completed, all_ok={all_ok}")
             Prompt.ask("\nPulsa Enter para volver", default="")
-        elif sub == "b":
+        elif sub == "0":
             break
 
 
@@ -224,16 +224,17 @@ def _submenu_extras():
         console.print()
         console.print(Panel(
             "\n"
+            # Lite: sin Chaos Maker (corrompe MKVs a propósito, solo sirve para
+            # probar el rescatador, que aquí no existe). CSI sube al 4.4.
             "  [bold cyan][4.1][/bold cyan]  Ingestor de Tags\n"
             "  [bold cyan][4.2][/bold cyan]  Comparador de Torrents\n"
             "  [bold cyan][4.3][/bold cyan]  Triaje MKV (HEVC vs H264)\n"
-            "  [bold cyan][4.4][/bold cyan]  Chaos Maker  [dim red](⚠ JODE MKVs — solo para pruebas)[/dim red]\n"
-            "  [bold cyan][4.5][/bold cyan]  CSI: Check, Search, Identify\n"
-            "  [bold cyan][b][/bold cyan]    Atrás\n",
+            "  [bold cyan][4.4][/bold cyan]  CSI: Check, Search, Identify\n"
+            "  [bold cyan][0][/bold cyan]    Atrás\n",
             title="[bold blue]Extras[/bold blue]",
             border_style="blue",
         ))
-        sub = Prompt.ask("root@singularidad:extras", choices=["4.1", "4.2", "4.3", "4.4", "4.5", "b"], default="b")
+        sub = Prompt.ask("root@singularidad:extras", choices=["4.1", "4.2", "4.3", "4.4", "0"], default="0")
         log.info(f"Extras submenu: {sub}")
 
         if sub == "4.1":
@@ -265,27 +266,9 @@ def _submenu_extras():
             _run(["python3", triage_script, str(path)])
 
         elif sub == "4.4":
-            console.print()
-            console.print(Panel(
-                "[bold red]⚠ AVISO IMPORTANTE[/bold red]\n\n"
-                "El Chaos Maker JODE los MKVs a propósito metiéndoles ruido.\n"
-                "Úsalo SOLO con archivos de prueba, NUNCA con tus cosas de verdad.",
-                border_style="red",
-            ))
-            if Prompt.ask("¿Estás seguro de la que vas a liar?", choices=["s", "n"], default="n") == "s":
-                while True:
-                    path_raw = Prompt.ask("[bold]Dime el directorio con los MKVs de prueba[/bold]").strip()
-                    path = Path(path_raw)
-                    if path.is_dir():
-                        break
-                    console.print(f"[red]✗ Esto no es un directorio válido: {path_raw}[/red]")
-                log.warning(f"Chaos Maker launched on: {path}")
-                _run(["python3", "extras/Chaos-Maker/chaos-maker.py", str(path)])
-
-        elif sub == "4.5":
             _run(["python3", "extras/CSI/csi.py"])
 
-        elif sub == "b":
+        elif sub == "0":
             break
 
 
@@ -324,7 +307,11 @@ def _me_load_config() -> dict:
         "imgbb_api":     os.getenv("ME_IMGBB_API",           ""),
         "ptscreens_api": os.getenv("ME_PTSCREENS_API",       ""),
         "tmp_root":      os.getenv("ME_TMP_ROOT",            str(BASE_DIR / "RawLoadrr" / "tmp")),
-        "user_agent":    os.getenv("ME_CUSTOM_USER_AGENT",   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+        # Por defecto 'undici', no un UA de navegador. Un UA de navegador aquí
+        # es lo que provoca un 403 en la primera petición del scraper contra un
+        # tracker cuyo WAF espera el UA del cliente. Debe cuadrar con
+        # CUSTOM_USER_AGENT del .env.
+        "user_agent":    os.getenv("ME_CUSTOM_USER_AGENT",   "undici"),
     }
 
 
@@ -755,19 +742,25 @@ def main_menu():
         menu.add_column("MÓDULO", style="white")
         menu.add_column("ESTADO", justify="right")
 
+        # EDICIÓN LITE. Fuera del menú, y por qué:
+        #   Recordrr  -> necesita Google Chrome, que no existe para ARM64, y el
+        #                Chromium de ARM64 no lleva Widevine.
+        #   God/Goddess Mode -> sus fases 1 y 2 (extracción de ISOs, rescate y
+        #                triaje con decodificación) transcodifican. Lo que queda
+        #                del pipeline, subir y editar, es la opción [5].
+        # Numeración corrida y toda numérica: sin mezclar letras y números.
         menu.add_row("1", "MKVerything (Auditoría y Spam)", "[green]EN LÍNEA[/green]")
         menu.add_row("2", "RawLoadrr (Subidas automáticas)", "[green]EN LÍNEA[/green]")
         menu.add_row("3", "UNIT3D Ed. (Edita en el Tracker)", "[yellow]LISTO[/yellow]")
-        menu.add_row("4", "Extras (Ingestor, Triaje, Chaos)", "[blue]ACTIVO[/blue]")
-        menu.add_row("5", "SINGULARIDAD (God Mode - Full Check)", "[red]LENTO[/red]")
-        menu.add_row("6", "SINGULARIDAD (Goddess Mode - Fast Check)", "[magenta]VUELO[/magenta]")
-        menu.add_row("7", "Mantenimiento & Limpieza", "[red]PELIGRO[/red]")
-        menu.add_row("8", "Download more RAM", "[magenta]GRATIS[/magenta]") # <--- Desplazada al 8
+        menu.add_row("4", "Extras (Ingestor, Triaje, CSI)", "[blue]ACTIVO[/blue]")
+        menu.add_row("5", "SINGULARIDAD (Subida + Edición masiva)", "[cyan]EN CADENA[/cyan]")
+        menu.add_row("6", "Mantenimiento & Limpieza", "[red]PELIGRO[/red]")
+        menu.add_row("7", "Download more RAM", "[magenta]GRATIS[/magenta]")
         menu.add_row("0", "Cerrar Conexión", "")
 
         console.print(Align.center(Panel(menu, border_style="cyan", padding=(1, 5))))
 
-        sel = Prompt.ask("root@singularidad", choices=["1", "2", "3", "4", "5", "6", "7", "8", "0"])
+        sel = Prompt.ask("root@singularidad", choices=["1", "2", "3", "4", "5", "6", "7", "0"])
         log.info(f"Main menu selection: {sel}")
 
         if sel == "1":
@@ -778,12 +771,11 @@ def main_menu():
             unit3d_orchestrator()
         elif sel == "4":
             _submenu_extras()
-        elif sel in ["5", "6"]:
-            fast_scan_flag = (sel == "6")
-            singularity_mode(fast_scan=fast_scan_flag)  
-        elif sel == "7":
+        elif sel == "5":
+            singularity_mode()
+        elif sel == "6":
             _submenu_mantenimiento()
-        elif sel == "8":
+        elif sel == "7":
             _run(["python3", "RawLoadrr/data/reconfig.py"])
         elif sel == "0":
             log.info("User exited Singularity")
@@ -797,11 +789,13 @@ def _singularity_summary(results: dict, elapsed_total: float):
         "ERROR": "[red]✗ ERROR[/red]",
         "SKIP":  "[dim]— SALTADO[/dim]",
     }
+    # Las claves internas (fase2/3/4) se conservan tal cual para no tocar el
+    # resto del pipeline; solo cambia el número que se muestra. En Lite no hay
+    # fase1 (MKVerything Modo Dios: transcodifica).
     labels = {
-        "fase1": "Fase 1 · MKVerything Modo Dios",
-        "fase2": "Fase 2 · Triaje MKV",
-        "fase3": "Fase 3 · Auto-Upload",
-        "fase4": "Fase 4 · Orquestador UNIT3D",
+        "fase2": "Fase 1 · Triaje MKV",
+        "fase3": "Fase 2 · Auto-Upload",
+        "fase4": "Fase 3 · Orquestador UNIT3D",
     }
     t = Table(box=None, show_header=True, header_style="bold magenta")
     t.add_column("FASE", style="cyan")
@@ -956,28 +950,25 @@ def _ensure_credentials(need_unit3d: bool) -> None:
             console.print("[green]✓ ¡Ale! Credenciales guardadas en el .env[/green]")
 
 
-def singularity_mode(fast_scan=False):
+def singularity_mode():
     clear_screen()
-    
-    # --- Lógica de Identidad Visual ---
-    if fast_scan:
-        mode_label = "GODDESS MODE — LUDICROUS PIPELINE"
-        mode_style = "magenta"
-    else:
-        mode_label = "MODO SINGULARIDAD — PIPELINE AUTOMÁTICO"
-        mode_style = "red"
 
-    # --- Aplicamos el estilo al Banner ---
+    mode_label = "MODO SINGULARIDAD — PIPELINE AUTOMÁTICO"
+    mode_style = "cyan"
+
     console.print(Rule(f"[bold {mode_style}]⚡ {mode_label}[/bold {mode_style}]", style=mode_style))
-    
-    # --- Panel con las fases ---
+
+    # EDICIÓN LITE: la antigua Fase 1 (MKVerything God Mode: extraer ISOs,
+    # convertir legacy, rescatar MKVs) no está. Transcodifica y necesita
+    # MakeMKV y VapourSynth. Las otras tres fases sí siguen: el triaje solo
+    # lee codecs con ffprobe, y subir y editar no tocan vídeo.
+    # Por eso tampoco hay God vs Goddess: fast_scan solo afectaba a la Fase 1.
     console.print(Panel(
         "\n"
         "  Estas son las fases que se van a ejecutar solitas:\n\n"
-        "  [bold red][1][/bold red]  MKVerything God Mode   — Saca de ISOs + convierte viejales + rescata MKVs\n"
-        "  [bold yellow][2][/bold yellow]  Triaje MKV             — Separa HEVC de H264\n"
-        "  [bold green][3][/bold green]  RawLoadrr Auto-Upload  — Sube a cholón la lista de HEVC\n"
-        "  [bold blue][4][/bold blue]  Orquestador UNIT3D     — (Opcional) Lanza los scripts 01-04\n",
+        "  [bold yellow][1][/bold yellow]  Triaje MKV             — Separa HEVC de H264 (solo lee codecs)\n"
+        "  [bold green][2][/bold green]  RawLoadrr Auto-Upload  — Sube a cholón la lista elegida\n"
+        "  [bold blue][3][/bold blue]  Orquestador UNIT3D     — (Opcional) Lanza los scripts 01-04\n",
         title="[bold white]Qué se va a liar[/bold white]",
         border_style="white",
     ))
@@ -991,13 +982,6 @@ def singularity_mode(fast_scan=False):
         if media_root.is_dir():
             break
         console.print(f"[red]✗ No es un directorio válido: {media_root_str}[/red]")
-
-    iso_output_str = Prompt.ask(
-        "[bold]¿Dónde escupo los archivos que saque de las ISOs?[/bold]\n"
-        "  [dim](pulsa Enter para usar la misma carpeta raíz)[/dim]",
-        default=str(media_root),
-    ).strip()
-    iso_output = Path(iso_output_str) if iso_output_str else media_root
 
     tracker = Prompt.ask(
         "[bold]Dime la abreviatura del tracker para subir[/bold]\n"
@@ -1029,7 +1013,7 @@ def singularity_mode(fast_scan=False):
             console.print(f"[red]✗ Esto no es un fichero válido: {cl_raw}[/red]")
 
     run_unit3d = Prompt.ask(
-        "¿Le damos caña a la [bold]Fase 4 - Orquestador UNIT3D[/bold]?\n"
+        "¿Le damos caña a la [bold]Fase 3 - Orquestador UNIT3D[/bold]?\n"
         "  [dim](edita en masa los torrents del tracker: scraping, indexado, descripciones e imágenes)[/dim]",
         choices=["s", "n"],
         default="n",
@@ -1060,9 +1044,8 @@ def singularity_mode(fast_scan=False):
         "4": "Todo el directorio  (HEVC + H264/Legacy)",
     }
     cfg_table.add_row("Raíz de medios", str(media_root))
-    cfg_table.add_row("Salida ISOs", str(iso_output))
     cfg_table.add_row("Tracker", tracker)
-    cfg_table.add_row("Lista Fase 3", _list_mode_labels[list_mode])
+    cfg_table.add_row("Lista Fase 2", _list_mode_labels[list_mode])
     cfg_table.add_row("UNIT3D", "Sí" if run_unit3d == "s" else "No")
     if run_unit3d == "s":
         cfg_table.add_row("IDs UNIT3D", f"{unit3d_start} → {unit3d_end}")
@@ -1077,83 +1060,12 @@ def singularity_mode(fast_scan=False):
     start_time_total = time.time()
 
     # ------------------------------------------------------------------ #
-    # FASE 1 — MKVerything God Mode                                       #
+    # FASE 1 — Triaje MKV                                                  #
     # ------------------------------------------------------------------ #
     console.print()
-    fase1_label = "FASE 1 — MKVerything: MODO DIOSA" if fast_scan else "FASE 1 — MKVerything: MODO DIOS"
-    fase1_style = "magenta" if fast_scan else "red"
-    console.print(Rule(f"[bold {fase1_style}]{fase1_label}[/bold {fase1_style}]", style=fase1_style))
-    update_status("PIPELINE", "FASE 1: MKVerything", "CURRANDO", progress=10, details="Empezando extracción y rescate")
-    log.info("Singularity Phase 1 start (MKVerything God Mode)")
-    t1 = time.time()
-    try:
-        from modules.extract import IsoExtractor
-        from modules.universal_rescuer import UniversalRescuer
-
-        god_stats = {
-            "isos_ok": 0, "isos_fail": 0,
-            "processed": 0, "saved_bytes": 0,
-            "failed": 0, "skipped": 0,
-        }
-
-        isos = list(media_root.rglob("*.iso"))
-        if isos:
-            console.print(f"[cyan]💿 {len(isos)} ISOs localizadas — a destriparlas...[/cyan]")
-            extractor = IsoExtractor()
-            for iso in isos:
-                console.print(f"  → {iso.name}")
-                ok = extractor.extraer_iso(str(iso), str(iso_output))
-                if ok:
-                    god_stats["isos_ok"] += 1
-                else:
-                    god_stats["isos_fail"] += 1
-        else:
-            console.print("[dim]  (No he visto ISOs por aquí)[/dim]")
-
-        video_exts = ('.avi', '.mp4', '.mkv', '.wmv', '.mov', '.divx', '.m4v')
-        all_video_files = [
-            str(f) for f in media_root.rglob("*")
-            if f.suffix.lower() in video_exts
-        ]
-
-        if all_video_files:
-            console.print(f"[cyan]🎬 {len(all_video_files)} vídeos en el punto de mira — a procesar...[/cyan]")
-            rescuer = UniversalRescuer()
-            for vpath in all_video_files:
-                is_mkv = vpath.lower().endswith('.mkv')
-                res = rescuer.procesar_lista([vpath], modo_estricto=is_mkv, fast_scan=fast_scan)
-                if res:
-                    god_stats["processed"] += res.get("processed", 0)
-                    god_stats["saved_bytes"] += res.get("saved_bytes", 0)
-                    god_stats["failed"] += len(res.get("failed", []))
-                    god_stats["skipped"] += len(res.get("skipped", []))
-        else:
-            console.print("[dim]  (No he encontrado vídeos para toquetear)[/dim]")
-
-        phase_results["fase1"] = {
-            "status": "OK",
-            "elapsed": time.time() - t1,
-            "stats": god_stats,
-        }
-        console.print("[green]✓ Fase 1 finiquitada.[/green]")
-        log.info(f"Singularity Phase 1 OK: {god_stats}")
-
-    except Exception as exc:
-        log.error(f"Singularity Phase 1 failed: {exc}")
-        phase_results["fase1"] = {
-            "status": "ERROR",
-            "elapsed": time.time() - t1,
-            "error": str(exc),
-        }
-        console.print(f"[red]✗ La Fase 1 ha petado: {exc}[/red]")
-
-    # ------------------------------------------------------------------ #
-    # FASE 2 — Triage MKV                                                 #
-    # ------------------------------------------------------------------ #
-    console.print()
-    console.print(Rule("[bold yellow]FASE 2 — Triaje MKV (HEVC vs Jurásico)[/bold yellow]", style="yellow"))
-    update_status("PIPELINE", "FASE 2: Triaje", "CURRANDO", progress=40, details="Analizando codecs")
-    log.info("Singularity Phase 2 start (Triage)")
+    console.print(Rule("[bold yellow]FASE 1 — Triaje MKV (HEVC vs Jurásico)[/bold yellow]", style="yellow"))
+    update_status("PIPELINE", "FASE 1: Triaje", "CURRANDO", progress=20, details="Analizando codecs")
+    log.info("Singularity Phase 1 start (Triage)")
     t2 = time.time()
     upload_list_path: "Path | None" = None
     try:
@@ -1196,7 +1108,7 @@ def singularity_mode(fast_scan=False):
                 "count": count,
             }
             console.print(
-                f"[green]✓ Fase 2 finiquitada — {count} carpetas en la lista '{list_label_p2}' listas para el despegue.[/green]"
+                f"[green]✓ Fase 1 finiquitada — {count} carpetas en la lista '{list_label_p2}' listas para el despegue.[/green]"
             )
         else:
             phase_results["fase2"] = {
@@ -1205,26 +1117,26 @@ def singularity_mode(fast_scan=False):
                 "msg": f"Lista {list_label_p2} vacía o no encontrada",
             }
             console.print(
-                f"[yellow]⚠ Fase 2: La lista '{list_label_p2}' no se ha generado o está a cero.[/yellow]"
+                f"[yellow]⚠ Fase 1: La lista '{list_label_p2}' no se ha generado o está a cero.[/yellow]"
             )
-        log.info(f"Singularity Phase 2 done, upload_list={upload_list_path}, mode={list_mode}")
+        log.info(f"Singularity Phase 1 done, upload_list={upload_list_path}, mode={list_mode}")
 
     except Exception as exc:
-        log.error(f"Singularity Phase 2 failed: {exc}")
+        log.error(f"Singularity Phase 1 failed: {exc}")
         phase_results["fase2"] = {
             "status": "ERROR",
             "elapsed": time.time() - t2,
             "error": str(exc),
         }
-        console.print(f"[red]✗ La Fase 2 ha petado: {exc}[/red]")
+        console.print(f"[red]✗ La Fase 1 ha petado: {exc}[/red]")
 
     # ------------------------------------------------------------------ #
-    # FASE 3 — RawLoadrr Auto-Upload                                      #
+    # FASE 2 — RawLoadrr Auto-Upload                                       #
     # ------------------------------------------------------------------ #
     console.print()
-    console.print(Rule("[bold green]FASE 3 — RawLoadrr: Fuego a Discreción[/bold green]", style="green"))
-    update_status("PIPELINE", "FASE 3: Auto-Upload", "CURRANDO", progress=70, details="Inyectando torrents al tracker")
-    log.info("Singularity Phase 3 start (Auto-Upload)")
+    console.print(Rule("[bold green]FASE 2 — RawLoadrr: Fuego a Discreción[/bold green]", style="green"))
+    update_status("PIPELINE", "FASE 2: Auto-Upload", "CURRANDO", progress=60, details="Inyectando torrents al tracker")
+    log.info("Singularity Phase 2 start (Auto-Upload)")
     t3 = time.time()
     if upload_list_path and upload_list_path.exists():
         try:
@@ -1236,32 +1148,32 @@ def singularity_mode(fast_scan=False):
             phase_results["fase3"] = {"status": status, "elapsed": time.time() - t3, "rc": rc}
             color = "green" if rc == 0 else "yellow"
             symbol = "✓" if rc == 0 else "⚠"
-            console.print(f"[{color}]{symbol} Fase 3 finiquitada (código de salida: {rc}).[/{color}]")
-            log.info(f"Singularity Phase 3: rc={rc}")
+            console.print(f"[{color}]{symbol} Fase 2 finiquitada (código de salida: {rc}).[/{color}]")
+            log.info(f"Singularity Phase 2: rc={rc}")
         except Exception as exc:
-            log.error(f"Singularity Phase 3 failed: {exc}")
+            log.error(f"Singularity Phase 2 failed: {exc}")
             phase_results["fase3"] = {
                 "status": "ERROR",
                 "elapsed": time.time() - t3,
                 "error": str(exc),
             }
-            console.print(f"[red]✗ La Fase 3 ha petado: {exc}[/red]")
+            console.print(f"[red]✗ La Fase 2 ha petado: {exc}[/red]")
     else:
         phase_results["fase3"] = {
             "status": "SKIP",
             "elapsed": 0,
             "msg": "Sin lista de upload — fase omitida",
         }
-        console.print("[yellow]⚠ Fase 3 omitida: no tengo lista para subir nada.[/yellow]")
+        console.print("[yellow]⚠ Fase 2 omitida: no tengo lista para subir nada.[/yellow]")
 
     # ------------------------------------------------------------------ #
-    # FASE 4 — UNIT3D Orchestrator (opcional)                             #
+    # FASE 3 — UNIT3D Orchestrator (opcional)                              #
     # ------------------------------------------------------------------ #
     if run_unit3d == "s":
         console.print()
-        console.print(Rule("[bold blue]FASE 4 — Orquestador UNIT3D[/bold blue]", style="blue"))
-        update_status("PIPELINE", "FASE 4: Orquestador", "CURRANDO", progress=90, details="Haciendo mantenimiento masivo en el tracker")
-        log.info(f"Singularity Phase 4 start (UNIT3D), IDs {unit3d_start}-{unit3d_end}")
+        console.print(Rule("[bold blue]FASE 3 — Orquestador UNIT3D[/bold blue]", style="blue"))
+        update_status("PIPELINE", "FASE 3: Orquestador", "CURRANDO", progress=85, details="Haciendo mantenimiento masivo en el tracker")
+        log.info(f"Singularity Phase 3 start (UNIT3D), IDs {unit3d_start}-{unit3d_end}")
         t4 = time.time()
         try:
             os.environ["ID_START"] = str(unit3d_start)
@@ -1287,16 +1199,16 @@ def singularity_mode(fast_scan=False):
                 "elapsed": time.time() - t4,
                 "scripts": script_results,
             }
-            console.print("[green]✓ Fase 4 finiquitada.[/green]")
-            log.info("Singularity Phase 4 OK")
+            console.print("[green]✓ Fase 3 finiquitada.[/green]")
+            log.info("Singularity Phase 3 OK")
         except Exception as exc:
-            log.error(f"Singularity Phase 4 failed: {exc}")
+            log.error(f"Singularity Phase 3 failed: {exc}")
             phase_results["fase4"] = {
                 "status": "ERROR",
                 "elapsed": time.time() - t4,
                 "error": str(exc),
             }
-            console.print(f"[red]✗ La Fase 4 ha petado: {exc}[/red]")
+            console.print(f"[red]✗ La Fase 3 ha petado: {exc}[/red]")
 
     _singularity_summary(phase_results, time.time() - start_time_total)
     update_status("PIPELINE", "COMPLETADO", "FINIQUITADO", progress=100, details="Pipeline completado con éxito")
@@ -1305,6 +1217,10 @@ def singularity_mode(fast_scan=False):
 
 
 if __name__ == "__main__":
+    # Interactive entrypoint: abort hard. A user sitting at the TUI can act on
+    # the message immediately, and continuing would only fail later, deeper in.
+    from core.preflight import enforce as _preflight_enforce
+    _preflight_enforce()
     try:
         main_menu()
     except KeyboardInterrupt:

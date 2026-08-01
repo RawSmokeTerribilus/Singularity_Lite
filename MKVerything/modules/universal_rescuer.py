@@ -11,7 +11,7 @@ try:
 except ImportError:
     _VS_AVAILABLE = False
 
-from .verifier import Verifier, GOOD_CODECS
+from .verifier import Verifier, GOOD_CODECS, PORTABLE_SUB_CODECS
 from .hardware_agent import HardwareAgent
 
 _MKVE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -96,12 +96,27 @@ clip.set_output()
             return self._run_command(cmd_no_subs, level_name + " (sin subs)")
         return result  # FALLBACK_TRIGGERED pasa hacia arriba sin cambios
 
+    def _text_sub_maps(self, input_file, input_idx=0):
+        """Devuelve los args -map para SOLO los subtítulos de texto (convertibles a
+        SRT). Los de imagen (dvd_subtitle, PGS, DVB...) se omiten a propósito: no se
+        pueden pasar a SRT, revientan el transcode y se rompen en reproductores raros.
+        Así conservamos los subs buenos y tiramos los tóxicos sin tumbar el encode.
+        `input_idx` = índice del input del que salen los subs (0 normal, 1 en Nivel 3)."""
+        meta = self.verifier._run_ffprobe(input_file)
+        maps = []
+        for s in (meta or {}).get('streams', []):
+            if (s.get('codec_type') == 'subtitle' and
+                    s.get('codec_name', '').lower() in PORTABLE_SUB_CODECS):
+                maps.append(f"-map {input_idx}:{s['index']}")
+        return " ".join(maps)
+
     def execute_strategy(self, level, input_file, output_file, source_codec=None):
         """Construye y ejecuta el comando FFmpeg según el nivel y la estrategia del HardwareAgent.
 
         Reglas globales aplicadas en todos los niveles:
           - Mapeado explícito: solo video, audio y subtítulos (nada de carátulas/adjuntos)
-          - Subtítulos → SRT; si fallan, se descartan (no se tira el transcode)
+          - Subtítulos: SOLO los de texto → SRT; los de imagen (PGS/VOBSUB/DVB) se
+            descartan siempre. Si aun así fallan, se descartan (no se tira el transcode)
           - -map_metadata -1: sin spam en los metadatos del contenedor
           - Audio → AAC siempre
         """
@@ -115,10 +130,12 @@ clip.set_output()
                 return False
             hw_args = self.agent.get_transcode_args(target_codec="h264")
             vpy_path = str(Path(FAST_WORK_DIR) / "script.vpy")
+            # Subs del original (input 1): solo texto, imagen descartada
+            sub_maps = self._text_sub_maps(input_file, input_idx=1)
             # Video del pipe VapourSynth, audio/subs del original
             cmd_subs   = (f"{_VSPIPE_BIN} -c y4m \"{vpy_path}\" - | "
                           f"ffmpeg -hide_banner -y -i - -i \"{input_file}\" "
-                          f"-map 0:v:0 -map 1:a? -map 1:s? -map -1:d "
+                          f"-map 0:v:0 -map 1:a? {sub_maps} -map -1:d "
                           f"{hw_args} -c:a aac -c:s srt {CLEAN_FLAGS} \"{output_file}\"")
             cmd_no_subs = (f"{_VSPIPE_BIN} -c y4m \"{vpy_path}\" - | "
                            f"ffmpeg -hide_banner -y -i - -i \"{input_file}\" "
@@ -138,9 +155,10 @@ clip.set_output()
                 video_args  = "-c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p"
                 audio_args  = "-c:a aac -af aresample=async=1"
                 self._log(f"   🔄 {level_name}: codec fuente '{source_codec}' → h264 -crf 18")
+            sub_maps = self._text_sub_maps(input_file, input_idx=0)
             base = (f"ffmpeg -hide_banner -y -fflags +genpts -i \"{input_file}\" "
                     f"-map 0:v:0 -map 0:a? -map -0:d ")
-            cmd_subs    = base + f"-map 0:s? {video_args} {audio_args} -c:s srt {CLEAN_FLAGS} \"{output_file}\""
+            cmd_subs    = base + f"{sub_maps} {video_args} {audio_args} -c:s srt {CLEAN_FLAGS} \"{output_file}\""
             cmd_no_subs = base + f"-sn {video_args} {audio_args} {CLEAN_FLAGS} \"{output_file}\""
             return self._run_with_sub_fallback(cmd_subs, cmd_no_subs, output_file, level_name)
 
@@ -148,9 +166,10 @@ clip.set_output()
             level_name_hw = "Nivel 1 (HW)"
             self._log(f"   🪜 {level_name_hw}: Intentando recodificación acelerada por hardware...")
             hw_args = self.agent.get_transcode_args(target_codec="h264")
+            sub_maps = self._text_sub_maps(input_file, input_idx=0)
             base_hw = (f"ffmpeg -hide_banner -y -i \"{input_file}\" "
                        f"-map 0:v:0 -map 0:a? -map -0:d ")
-            cmd_hw_subs    = base_hw + f"-map 0:s? {hw_args} -c:a aac -c:s srt {CLEAN_FLAGS} \"{output_file}\""
+            cmd_hw_subs    = base_hw + f"{sub_maps} {hw_args} -c:a aac -c:s srt {CLEAN_FLAGS} \"{output_file}\""
             cmd_hw_no_subs = base_hw + f"-sn {hw_args} -c:a aac {CLEAN_FLAGS} \"{output_file}\""
 
             result = self._run_with_sub_fallback(cmd_hw_subs, cmd_hw_no_subs, output_file, level_name_hw)
@@ -165,7 +184,7 @@ clip.set_output()
                         f"-fflags +genpts+igndts+discardcorrupt "
                         f"-i \"{input_file}\" "
                         f"-map 0:v:0 -map 0:a? -map -0:d ")
-            cmd_cpu_subs    = (base_cpu + f"-map 0:s? "
+            cmd_cpu_subs    = (base_cpu + f"{sub_maps} "
                                f"-c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p "
                                f"-c:a aac -c:s srt "
                                f"-metadata:s:v:0 sar=1/1 {CLEAN_FLAGS} \"{output_file}\"")

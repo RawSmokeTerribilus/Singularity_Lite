@@ -1,5 +1,0 @@
-LIBRARY libmakemkv
-EXPORTS
-  set_world=set_world
-  MkvCreateFile=MkvCreateFile
-

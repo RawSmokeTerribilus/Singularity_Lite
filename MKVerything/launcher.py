@@ -122,21 +122,27 @@ def main():
         
         print(f"\n   {C_YELLOW}--- HERRAMIENTAS INDIVIDUALES ---{C_RESET}")
         print("   [1] ⚖️  AUDITORÍA DE CAMPO (Recursivo + Informe de Bajas)")
-        print("   [2] 🚑 Rescatar MKVs Rotos (Lista/Ruta)")
-        print("   [3] 🎞️  Convertir Legacy (AVI/MP4 -> MKV)")
-        print("   [4] 📦 Extraer ISOs (MakeMKV)")
-        
-        print(f"\n   {C_RED}--- ZONA PELIGROSA ---{C_RESET}")
-        print(f"   [5] ⚡ {C_RED}GOD MODE (Extracción + Conversión + Rescate Desatendido){C_RESET}")
-        print(f"   [6] 🌸 {C_MAGENTA}GODDESS MODE (Fast Scan: Check Estructural sin Decodificación){C_RESET}")
-        
+
         print("\n   [0] 🚪 SALIR")
-        
+
+        # EDICIÓN LITE: el rescate, la conversión legacy, la extracción de ISOs
+        # y los modos God/Goddess no se incluyen. Todos ellos transcodifican o
+        # dependen de MakeMKV (binarios x86_64) y VapourSynth, que esta imagen
+        # no lleva. Auditar es barato: solo lee metadatos. Reconstruir no.
+        # Para eso, usa la suite completa en una máquina de escritorio.
+
         opcion = input(f"\n   {C_GREEN}👉 Selecciona: {C_RESET}")
 
         try:
             if opcion == "0":
                 sys.exit()
+
+            elif opcion in ("2", "3", "4", "5", "6"):
+                print(f"\n   {C_YELLOW}⚠  Esa opción no existe en Singularity Lite.{C_RESET}")
+                print("   Rescate, conversión, extracción de ISOs y God/Goddess Mode")
+                print("   requieren transcodificación. Usa la suite completa.")
+                input("\n   Pulsa Enter para volver...")
+                continue
 
             elif opcion == "1":
                 from modules import verifier
@@ -147,6 +153,19 @@ def main():
                     print("❌ La ruta no existe.")
                     time.sleep(2)
                     continue
+
+                # Profundidad del escaneo. Determinante en hardware modesto:
+                #   rápido -> mkvmerge -J + ffprobe. Solo lee cabeceras.
+                #   profundo -> además decodifica el fichero entero con
+                #               `ffmpeg -xerror -f null -`. Detecta corrupción
+                #               que las cabeceras no delatan, pero en una Pi o
+                #               un NAS son horas por biblioteca.
+                print(f"\n   {C_YELLOW}Profundidad:{C_RESET}")
+                print("   [1] Rápido   — solo estructura y metadatos (recomendado)")
+                print("   [2] Profundo — decodifica cada fichero (lento; horas en hardware modesto)")
+                modo = input("\n   👉 Selecciona [1]: ").strip() or "1"
+                fast = (modo != "2")
+                print(f"\n   Modo: {C_CYAN}{'rápido' if fast else 'profundo'}{C_RESET}")
 
                 fecha_str = datetime.now().strftime("%d-%m-%y")
                 logs_dir = os.path.join(BASE_DIR, "logs")
@@ -172,7 +191,7 @@ def main():
                     update_status("MKVERYTHING", "Auditoría", "PROCESSING", progress=prog, details=f"Escaneando: {os.path.basename(f)}")
 
                     # Triage unificado (detecta legacy, corruptos y sospechosos)
-                    triage    = v.triage_file(f, fast_mode=False)
+                    triage    = v.triage_file(f, fast_mode=fast)
                     spam_info = v.audit_file_metadata(f)
 
                     if triage["action"] == "FLAG_SUSPICIOUS":
@@ -203,129 +222,15 @@ def main():
 
                 if rotos > 0:
                     print(f"\n📢 Lista de bajas: {C_CYAN}{archivo_bajas}{C_RESET}")
-                    lanzar = input(f"\n🚑 ¿Enviar los {rotos} archivos al Rescatador ahora? (s/n): ")
-                    if lanzar.lower() == 's':
-                        from modules import universal_rescuer
-                        rescuer = universal_rescuer.UniversalRescuer()
-                        rescuer.procesar_lista(archivo_bajas, modo_estricto=True, fast_scan=False)
+                    # EDICIÓN LITE: sin hand-off al Rescatador. Reconstruir un MKV
+                    # transcodifica, y esta imagen no lleva VapourSynth. La lista
+                    # es portable: pásala a la suite completa en una máquina capaz.
+                    print(f"   {C_YELLOW}Lite no repara.{C_RESET} Llévate esa lista a la suite")
+                    print("   completa (opción [2] Rescatar) en una máquina de escritorio.")
                 else:
                     print(f"\n{C_GREEN}💎 Librería impecable. No se han detectado errores.{C_RESET}")
 
                 input("\n✅ Pulsa Enter para volver...")
-                continue
-
-            elif opcion == "2":
-                from modules import universal_rescuer
-                print("\n📂 Arrastra Video, Carpeta o TXT (Solo se procesarán MKVs ROTOS):")
-                path = input("👉 Ruta: ").strip().replace("'","").replace('"','')
-                update_status("MKVERYTHING", "Rescate MKV", "PROCESSING", details=f"Analizando: {os.path.basename(path)}")
-                rescuer = universal_rescuer.UniversalRescuer()
-                rescuer.procesar_lista(path, modo_estricto=True)
-                update_status("MKVERYTHING", "Rescate MKV", "COMPLETED")
-                input("\n✅ Pulsa Enter para volver...")
-                continue
-
-            elif opcion == "3":
-                from modules import universal_rescuer
-                folder = input("\n📂 Carpeta a escanear (Recursiva): ").strip().replace("'","").replace('"','')
-                legacy_files = scan_files(folder, ['.avi', '.mp4', '.m4v', '.divx', '.wmv', '.mov'])
-                
-                if legacy_files:
-                    print(f"\n🦕 Encontrados {len(legacy_files)} archivos antiguos.")
-                    confirm = input("¿Convertirlos a MKV H.264 Verificados? (s/n): ")
-                    if confirm.lower() == 's':
-                        update_status("MKVERYTHING", "Conversión Legacy", "PROCESSING", details=f"Encontrados: {len(legacy_files)} archivos")
-                        rescuer = universal_rescuer.UniversalRescuer()
-                        rescuer.procesar_lista(legacy_files, modo_estricto=False)
-                        update_status("MKVERYTHING", "Conversión Legacy", "COMPLETED")
-                input("\n✅ Pulsa Enter para volver...")
-                continue
-
-            elif opcion == "4":
-                from modules import extract
-                in_path = input("\n📂 Carpeta o ISO Origen: ").strip().replace("'","").replace('"','')
-                out_path = input("📂 Carpeta Destino (Enter para misma): ").strip().replace("'","").replace('"','')
-                if not out_path: out_path = in_path if os.path.isdir(in_path) else os.path.dirname(in_path)
-                
-                update_status("MKVERYTHING", "Extracción ISO", "PROCESSING", details=f"Origen: {os.path.basename(in_path)}")
-                ext = extract.IsoExtractor()
-                if os.path.isfile(in_path):
-                    ext.extraer_iso(in_path, out_path)
-                elif os.path.isdir(in_path):
-                    isos = scan_files(in_path, ['.iso'])
-                    print(f"   💿 Encontradas {len(isos)} ISOs.")
-                    for i, iso in enumerate(isos): 
-                        prog = int((i / len(isos)) * 100)
-                        update_status("MKVERYTHING", "Extracción ISO", "PROCESSING", progress=prog, details=f"Extrayendo: {os.path.basename(iso)}")
-                        ext.extraer_iso(iso, out_path)
-                
-                update_status("MKVERYTHING", "Extracción ISO", "COMPLETED", progress=100)
-                input("\n✅ Pulsa Enter para volver...")
-                continue
-
-            elif opcion in ["5", "6"]:
-                from modules import extract, universal_rescuer, verifier
-
-                is_goddess = (opcion == "6")
-                COLOR_MODE = C_MAGENTA if is_goddess else C_RED
-                MODE_NAME = "GODDESS MODE" if is_goddess else "GODS MODE"
-                PURGE_TXT = "--- THE FAST PURGE (GODDESS) IS READY ---" if is_goddess else "--- THE PURGE HAS BEGUN ---"
-
-                limpiar_pantalla()
-                
-                # --- BANNER SELECTION ---
-                if is_goddess:
-                    BANNER_STR = f"""{COLOR_MODE}{C_BOLD}
- ██████   ██████  █████   █████   ███████  ██████  ██████     ███    ███  ██████  ██████   ███████
-██       ██    ██ ██   ██ ██   ██ ██       ██      ██         ████  ████ ██    ██ ██    ██ ██     
-██   ███ ██    ██ ██   ██ ██   ██ █████    ██████  ██████     ██ ████ ██ ██    ██ ██    ██ █████  
-██    ██ ██    ██ ██   ██ ██   ██ ██           ██      ██     ██  ██  ██ ██    ██ ██    ██ ██     
- ██████   ██████  ██████  ██████  ███████  ██████  ██████     ██      ██  ██████  ██████   ███████
-                    {C_RESET}"""
-                else:
-                    BANNER_STR = f"""{COLOR_MODE}{C_BOLD}
- ██████   ██████  █████       ███    ███  ██████  ██████   ███████
-██       ██    ██ ██   ██     ████  ████ ██    ██ ██    ██ ██     
-██   ███ ██    ██ ██   ██     ██ ████ ██ ██    ██ ██    ██ █████  
-██    ██ ██    ██ ██   ██     ██  ██  ██ ██    ██ ██    ██ ██     
- ██████   ██████  █████       ██      ██  ██████  ██████   ███████
-                    {C_RESET}"""
-
-                print(BANNER_STR)
-                print(f"        {COLOR_MODE}{PURGE_TXT}{C_RESET}")
-
-                root_path = input(f"\n{C_BOLD}📂 Ruta Raíz para el escaneo:{C_RESET} ").strip().replace("'","").replace('"','')
-                out_iso_path = input(f"{C_BOLD}📂 Salida ISOs (Enter = origen):{C_RESET} ").strip().replace("'","").replace('"','')
-                if not out_iso_path: out_iso_path = root_path
-
-                # --- FASE 1: EXTRACCIÓN DE ISOs ---
-                print(f"\n{COLOR_MODE}--- FASE 1: EXTRACCIÓN DE ISOs (MakeMKV) ---{C_RESET}")
-                extractor = extract.IsoExtractor()
-                isos = scan_files(root_path, ['.iso'])
-                if isos:
-                    print(f"   💿 Encontradas {len(isos)} ISOs para procesar.")
-                    for iso in isos:
-                        anim = FakeProgress(f"Destripando {os.path.basename(iso)}")
-                        anim.start()
-                        extractor.extraer_iso(iso, out_iso_path)
-                        anim.stop(); anim.join()
-                        print(f"    ✅ {os.path.basename(iso)} procesada.")
-                else:
-                    print("   (Librería limpia de ISOs)")
-
-                # --- FASE 2: EL PIPELINE (CONVERSIÓN + RESCATE) ---
-                print(f"\n{COLOR_MODE}--- FASE 2: PIPELINE DE RESCATE ({'FAST' if is_goddess else 'FULL'}) ---{C_RESET}")
-                rescuer = universal_rescuer.UniversalRescuer()
-                
-                # Aquí está la clave: pasamos fast_scan=is_goddess
-                # Si es 6, fast_scan=True y el verifier usará el check_health rápido.
-                stats = rescuer.procesar_lista(root_path, modo_estricto=True, fast_scan=is_goddess)
-
-                print(f"\n{C_GREEN}✅ Purga finalizada.{C_RESET}")
-                if stats:
-                    print(f"   📊 Procesados: {stats['processed']} | Omitidos: {len(stats['skipped'])}")
-                
-                input(f"\n{C_YELLOW}Presiona Enter para volver...{C_RESET}")
                 continue
 
         except Exception as e:

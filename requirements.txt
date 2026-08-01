@@ -1,4 +1,6 @@
-# --- RaW Suite Master Requirements ---
+# --- Singularity Lite Requirements ---
+# Every entry here is arch-neutral: pure Python or has aarch64/armhf wheels.
+# Nothing pulls a compiler on a normal arm64 install.
 setuptools
 
 # Núcleo y TUI
@@ -19,6 +21,7 @@ aiohttp
 anitopy
 bencode.py
 cinemagoer
+cli_ui
 deluge-client
 ffmpeg-python
 guessit
@@ -38,8 +41,31 @@ torf
 tmdbsimple
 unidecode
 
-# Procesamiento de Video (VapourSynth)
-# Nota: En Docker instalaremos la base por apt-get, 
-# pero estas librerías de python son los puentes.
-vapoursynth
-awsmfunc
+# --- NOT IN LITE -------------------------------------------------------------
+# playwright, opencv-python-headless, simpleobsws
+#   Recordrr only. Recordrr is not shipped in Lite (no ARM64 Chrome, no Widevine
+#   on ARM64 Chromium). opencv and simpleobsws were never imported anywhere in
+#   the codebase at all.
+#
+# vapoursynth, awsmfunc
+#   Reached only through RawLoadrr/src/vs.py, which is imported lazily from
+#   src/prep.py behind the opt-in --vapoursynth flag. The default screenshot
+#   path shells out to ffmpeg and needs neither. Both also require the zimg /
+#   VapourSynth / l-smash source forges that Lite deliberately omits.
+#   => Do NOT pass --vapoursynth / -vs on a Lite install.
+# -----------------------------------------------------------------------------
+#
+# One entry above is a fix rather than a copy:
+#   cli_ui : imported at src/trackers/BLU.py:212 and declared in no requirements
+#            file. The import is lazy, so it only fires on the BLU upload path —
+#            which is why it has gone unnoticed (verified absent in the running
+#            production image). Undeclared dependency, added here.
+#
+# NOT added, and deliberately so:
+#   bencodepy : upload.py:36 does `import bencodepy as bencode` while
+#               src/clients.py:5 does `import bencode`, which looks like two
+#               distributions are needed. It isn't. `bencode.py` ships BOTH
+#               top-level packages — its RECORD owns bencode/ and bencodepy/.
+#               Adding the standalone `bencodepy` project on top makes two
+#               distributions fight over the same namespace, resolved by install
+#               order. Don't.

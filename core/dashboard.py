@@ -203,4 +203,9 @@ def run_dashboard():
 
 
 if __name__ == "__main__":
+    # This is the container's command (`python3 -m core.dashboard`), so it is
+    # the first thing that runs. Warn rather than exit: aborting here would put
+    # the container into a restart loop and bury the diagnostic.
+    from .preflight import warn as _preflight_warn
+    _preflight_warn()
     run_dashboard()
