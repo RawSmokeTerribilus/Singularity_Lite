@@ -718,10 +718,14 @@ config = {'AUTO': {'delay': 0, 'description_folder': None, 'dupe_similarity': 80
  #     Con cualquier otro valor el asistente no se lanza en una instalación
  #     nueva, y el handshake falla contra credenciales de plantilla.
  #
- #  2. 'qbit_url' va SIN puerto. El puerto se pasa aparte en 'qbit_port'.
- #     Si lo pones en los dos sitios sale http://127.0.0.1:8888:8888 y no
- #     conecta. Vale lo mismo cuando el asistente te pregunte: en "URL del
- #     Cliente" va solo el host, el puerto es la pregunta siguiente.
+ #  2. 'qbit_url' va SIN puerto, porque el puerto se pasa aparte en
+ #     'qbit_port'. Si lo pones en los dos sitios el log escribe
+ #     http://127.0.0.1:8888:8888, que asusta pero es SOLO cosmético:
+ #     qbittorrent-api usa el puerto de la URL e ignora el parámetro
+ #     redundante, y conecta igual (así lleva años corriendo en producción).
+ #     Se deja sin puerto por coherencia con el asistente, que pregunta la
+ #     URL y el puerto por separado. Si ves ese doble puerto en un error de
+ #     conexión, NO es la causa: mira las credenciales.
  'qbit': {'enable_search': True,
           'qbit_pass': 'PASSWORD',
           'qbit_port': '8888',
