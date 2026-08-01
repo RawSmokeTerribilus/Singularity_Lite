@@ -3,7 +3,11 @@ aiohttp
 anitopy
 beautifulsoup4
 bencode.py
-cinemagoer
+# PINNED: cinemagoer 2026.06.27 removed the HTTP access system entirely and switched the
+# default accessSystem from 'http' to 's3'. Cinemagoer() then builds an SQLAlchemy engine
+# from the bogus default URI 'sqlite://cinemagoer.db', which SQLAlchemy 2.x rejects, so
+# every construction raises ArgumentError before any lookup happens. Do not unpin.
+cinemagoer==2023.5.1
 deluge-client
 ffmpeg-python
 guessit
