@@ -38,21 +38,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean
 
 # 2. Instalación de MakeMKV (Usando archivos locales proporcionados)
-COPY extras/makemkv-install /tmp/makemkv-install
-WORKDIR /tmp/makemkv-install
-RUN MAKEMKV_VERSION=1.18.3 && \
-    # Build OSS
-    cd makemkv-oss-${MAKEMKV_VERSION} && \
-    ./configure && \
-    make -j$(nproc) && \
-    make install && \
-    cd .. && \
-    # Install BIN
-    cd makemkv-bin-${MAKEMKV_VERSION} && \
-    mkdir -p tmp && \
-    echo "yes" | make install && \
-    cd .. && \
-    rm -rf /tmp/makemkv-install
+#COPY extras/makemkv-install /tmp/makemkv-install
+#WORKDIR /tmp/makemkv-install
+#RUN MAKEMKV_VERSION=1.18.3 && \
+#    # Build OSS
+#    cd makemkv-oss-${MAKEMKV_VERSION} && \
+#    ./configure && \
+#    make -j$(nproc) && \
+#    make install && \
+#    cd .. && \
+#    # Install BIN
+#    cd makemkv-bin-${MAKEMKV_VERSION} && \
+#    mkdir -p tmp && \
+#    echo "yes" | make install && \
+#    cd .. && \
+#    rm -rf /tmp/makemkv-install
 
 # 3. Actualizamos herramientas de Python
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel cython
@@ -119,17 +119,17 @@ RUN git clone https://github.com/oatssss/L-SMASH-Works.git /tmp/lsmas-plugin && 
     rm -rf /tmp/lsmas-plugin
 
 # 1. Habilitamos contrib, non-free y non-free-firmware (Formato nuevo y viejo)
-RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
-        sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/g' /etc/apt/sources.list.d/debian.sources; \
-    else \
-        sed -i 's/main$/main contrib non-free non-free-firmware/g' /etc/apt/sources.list; \
-    fi && \
-    apt-get update && apt-get install -y \
-    mesa-va-drivers \
-    intel-media-va-driver-non-free \
-    libva-drm2 \
-    vainfo \
-    && rm -rf /var/lib/apt/lists/*
+#RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+#        sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/g' /etc/apt/sources.list.d/debian.sources; \
+#    else \
+#        sed -i 's/main$/main contrib non-free non-free-firmware/g' /etc/apt/sources.list; \
+#    fi && \
+#    apt-get update && apt-get install -y \
+#    mesa-va-drivers \
+#    intel-media-va-driver-non-free \
+#    libva-drm2 \
+#    vainfo \
+#    && rm -rf /var/lib/apt/lists/*
 
 # Variable de entorno de seguridad (luego el Agente la puede pisar)
 ENV MOZ_X11_EGL=1

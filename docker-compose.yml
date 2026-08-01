@@ -1,40 +1,28 @@
 services:
   singularity:
-    # 1. IMAGEN (LOCAL v1.6)
-    image: rawsmoke/singularity-suite:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/arm64
     container_name: singularity_core
     restart: unless-stopped
-    privileged: true
     user: "${PUID:-1000}:${PGID:-1000}"
-    group_add:
-      - "997"         # Acceso directo al grupo 'render' (AMD/Intel)
-      - "107"         # Por si acaso, el grupo 'video' en algunos RHEL
     env_file: ./config/.env
     command: python3 -m core.dashboard
     environment:
       - TZ=Europe/Madrid
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
-      - LIBVA_DRIVER_NAME=radeonsi # Fuerza el driver de AMD
-    devices:
-      - /dev/dri:/dev/dri # Mapeo explícito del hardware gráfico
-      - /dev/fb0:/dev/fb0 # Framebuffer (opcional pero ayuda en probes)
-
     deploy:
       resources:
         limits:
-          cpus: '6.0'
-          memory: 8G
-
-    # 3. VOLÚMENES RE-ALINEADOS
+          memory: 2G
     volumes:
-      # --- 1. CONFIGURACIÓN (Mantenemos montajes de archivos para estabilidad de 'make') ---
+      # --- 1. CONFIGURACIÓN ---
       - ./config/.env:/app/.env:z
       - ./config/singularity_config.py:/app/singularity_config.py:z
       - ./config/config.py:/app/RawLoadrr/data/config.py:z
       - ./config/mass_config.py:/app/extras/MASS-EDITION-UNIT3D/config.py:z
-#      - ./clean_vs_bad_descriptions.txt:/app/clean_vs_bad_descriptions.txt:z
-#      - ./leftover_pixhost_dirs.txt:/app/leftover_pixhost_dirs.txt:z
 
       # --- 2. WORK DATA & PERSISTENCIA ---
       - ./work_data/mass_editor/ids.txt:/app/extras/MASS-EDITION-UNIT3D/ids.txt:z
@@ -48,7 +36,7 @@ services:
       - ./work_data/reports:/app/MKVerything/docs:z
       - ./work_data/trackers:/app/RawLoadrr/src/trackers:z
       - ./work_data/reports:/app/work_data/reports:z
-      
+
       # --- 3. PERSISTENCIA DE MÓDULOS ---
       - ./work_data/logs/csi_log:/app/extras/CSI/csi_log:z
       - ./work_data/cookies:/app/RawLoadrr/data/cookies:z
@@ -56,13 +44,9 @@ services:
       - ./work_data/logs/mkverything:/app/MKVerything/logs:z
       - ./work_data/qbit_backup:/app/RawLoadrr/qbit_backup:z
 
-      # --- 4. EL ARSENAL (30TB) ---
-      - /run/media/${USER}:/run/media/${USER}:z
-      # v3.0.0 hardening: dropped blanket ${HOME}:${HOME}. Targeted mounts only.
-      - ${HOME}/Descargas:${HOME}/Descargas:z
-      - ${HOME}/Vídeos:${HOME}/Vídeos:z
-      - ${HOME}/Qbit_Docker:${HOME}/Qbit_Docker:z
-      - ./work_data:${HOME}/RaW_Suite_Docker/work_data:z
+      # --- 4. EL ARSENAL ---
+      - /mnt/armagedon_data/data:/data:z
+      - /mnt/armagedon/data:/cfg_data:z
 
     network_mode: host
     stdin_open: true
