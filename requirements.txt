@@ -1,49 +1,63 @@
 # --- Singularity Lite Requirements ---
 # Every entry here is arch-neutral: pure Python or has aarch64/armhf wheels.
 # Nothing pulls a compiler on a normal arm64 install.
-setuptools
+#
+# EVERY entry is pinned, deliberately. Lite publishes no image — every user
+# builds from source, so every install is a fresh dependency resolve and any
+# upstream release lands on them immediately. That is not hypothetical: on
+# 2026-08-02 an unpinned `cinemagoer` picked up upstream 2026.06.27, which
+# deleted the HTTP access system, and every upload crashed with an SQLAlchemy
+# error before a single lookup ran.
+#
+# The versions below are the set running in the maintainer's production image
+# (Python 3.11), so they are known-good together. Only direct dependencies are
+# pinned; transitive ones are left to the resolver so wheel selection on
+# aarch64/armhf stays free.
+setuptools==82.0.1
 
 # Núcleo y TUI
-rich
-python-dotenv
-requests[socks]>=2.28.0
-PySocks
+rich==15.0.0
+python-dotenv==1.2.2
+requests[socks]==2.34.2
+PySocks==1.7.1
 
 # Web Dashboard
-fastapi
-uvicorn
-jinja2
-beautifulsoup4
+fastapi==0.136.3
+uvicorn==0.49.0
+jinja2==3.1.6
+beautifulsoup4==4.15.0
 
 # RawLoadrr & Subida
-aiofiles
-aiohttp
-anitopy
-bencode.py
-# PINNED: cinemagoer 2026.06.27 removed the HTTP access system entirely and switched the
-# default accessSystem from 'http' to 's3'. Cinemagoer() then builds an SQLAlchemy engine
-# from the bogus default URI 'sqlite://cinemagoer.db', which SQLAlchemy 2.x rejects, so
-# every construction raises ArgumentError before any lookup happens. Do not unpin.
+aiofiles==25.1.0
+aiohttp==3.14.1
+anitopy==2.1.1
+# Ships BOTH the `bencode` and `bencodepy` top-level packages — see the note at
+# the bottom of this file before touching it.
+bencode.py==4.0.0
+# cinemagoer 2026.06.27 removed the HTTP access system entirely and switched the
+# default accessSystem from 'http' to 's3'. Cinemagoer() then builds an SQLAlchemy
+# engine from the bogus default URI 'sqlite://cinemagoer.db', which SQLAlchemy 2.x
+# rejects, so every construction raises ArgumentError before any lookup happens.
 cinemagoer==2023.5.1
-cli_ui
-deluge-client
-ffmpeg-python
-guessit
+cli_ui==0.19.0
+deluge-client==1.10.2
+ffmpeg-python==0.2.0
+guessit==3.8.0
 language-data<=1.2.0; python_version<='3.8'
 langcodes<=3.4.0; python_version<='3.8'
-langcodes; python_version>'3.8'
-nest_asyncio
-packaging
-pyimgbox
-pyotp
-pyoxipng
-pymediainfo
+langcodes==3.5.1; python_version>'3.8'
+nest_asyncio==1.6.0
+packaging==26.2
+pyimgbox==1.0.7
+pyotp==2.9.0
+pyoxipng==9.1.1
+pymediainfo==7.0.1
 qbittorrent-api<=2023.9.53; python_version<'3.8'
-qbittorrent-api; python_version>='3.8'
-tinytag
-torf
-tmdbsimple
-unidecode
+qbittorrent-api==2026.6.0; python_version>='3.8'
+tinytag==2.2.1
+torf==4.3.1
+tmdbsimple==2.9.6
+unidecode==1.4.0
 
 # --- NOT IN LITE -------------------------------------------------------------
 # playwright, opencv-python-headless, simpleobsws
