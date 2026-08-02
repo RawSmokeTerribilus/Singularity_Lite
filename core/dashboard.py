@@ -199,7 +199,14 @@ async def api_status():
 
 def run_dashboard():
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8002, log_level="warning")
+    # Loopback by default: the dashboard has no authentication, so it must not
+    # be reachable from the network unless the operator asks for it. Set
+    # DASHBOARD_HOST=0.0.0.0 in config/.env on a headless box (NAS, Raspberry
+    # Pi) where the browser lives on a different machine. The port is fixed
+    # because the Dockerfile HEALTHCHECK curls 127.0.0.1:8002, and 0.0.0.0
+    # includes loopback, so that check keeps working either way.
+    host = os.getenv("DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    uvicorn.run(app, host=host, port=8002, log_level="warning")
 
 
 if __name__ == "__main__":
