@@ -14,13 +14,18 @@ config = {'AUTO': {'delay': 0, 'description_folder': None, 'dupe_similarity': 80
                            'mantener viva la comunidad. '
                            '🌱[/b][/center][center][url=https://codeberg.org/RawSmoke/Singularity][img=400]https://i.ibb.co/0RrzLmSr/RAW-bruma-servers.png[/img][/url][/center]',
              'imdb_api': 'IMDB_API',
-             'img_host_1': 'imgbox',
-             'img_host_2': 'imgbb',
-             'img_host_3': 'pixhos',
-             'img_host_4': 'ptscreens',
-             'img_host_5': 'lensdump',
-             'img_host_6': 'oeimg',
-             'img_host_7': 'ptpimg',
+             # Cascada de hosts de imágenes: se prueba img_host_1, y si falla se
+             # pasa al siguiente. Elige hosts con API key y cuenta propia: si el
+             # host muere, se lleva por delante TODAS las galerías que subiste
+             # ahí. imgbox se deja fuera aposta — sube de forma anónima (no hay
+             # credencial que revocar) y en 2026 se cayó llevándose miles de
+             # galerías por delante. Para repararlas: extras/MASS-EDITION-UNIT3D/
+             # 05_image_regenerator.py.
+             'img_host_1': 'imgbb',
+             'img_host_2': 'ptscreens',
+             'img_host_3': 'oeimg',
+             'img_host_4': 'lensdump',
+             'img_host_5': 'ptpimg',
              'img_size': '600',
              'imgbb_api': 'IMGBB_API',
              'inline_imgs': 3,

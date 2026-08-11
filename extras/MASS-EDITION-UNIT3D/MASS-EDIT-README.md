@@ -86,6 +86,108 @@ Esta es la forma más sencilla y segura.
 
 ---
 
+## 🔥 `05_image_regenerator.py` — cuando el host de imágenes se cae
+
+`04_image_resurrector.py` **resube** PNGs que ya estén en `tmp/`. Si `tmp` se ha
+vaciado, no puede hacer nada: muere con `No hay imágenes locales`, y sin
+`mapeo_maestro.json` ni siquiera sabe qué carpeta mirar.
+
+`05` **genera las capturas de cero** con ffmpeg a partir del fichero original que
+sigue sembrándose en el cliente torrent. No depende de `tmp` ni de la secuencia
+01-04.
+
+### De dónde sale el mapeo id ↔ fichero
+
+UNIT3D escribe dentro del `.torrent` que sirve un comentario del tipo:
+
+```
+This torrent was downloaded from <SITIO>. https://<host>/torrents/<id>
+```
+
+qBittorrent lo expone en `torrents_info()` junto a `content_path`. Buscando ese
+patrón en los comentarios se obtiene **id del tracker → ruta absoluta**, exacto y
+sin *fuzzy matching*. Sustituye a `01_scraper` + `02_indexer` para este caso.
+
+> El patrón se busca contra el host del **sitio**, no el del announce: pueden ser
+> distintos (p.ej. announce en `tracker.ejemplo.cc` y sitio en `ejemplo.cc`).
+
+### Qué toca de la descripción
+
+Sólo las etiquetas `[url=…][img=…]…[/img][/url]` que apunten a un host de
+`ME_DEAD_HOSTS`. Conserva el ancho original del `[img=N]`, une las nuevas con un
+único espacio (los saltos de línea sueltos rompen el render del BBCode) y
+reenvía el resto del formulario tal cual: mediainfo, sinopsis, tráiler, banner,
+firma y metadatos quedan intactos. Si el número de imágenes muertas no cuadra y
+además no son contiguas, **no toca nada** y lo registra.
+
+### Configuración (ninguna credencial nueva)
+
+Reutiliza lo que ya haya configurado: la cookie `ME_*` de 03/04, y de
+`RawLoadrr/data/config.py` los `TORRENT_CLIENTS`, los `img_host_N` con sus API
+keys y `DEFAULT.screens`.
+
+| Variable | Por defecto | Qué hace |
+|---|---|---|
+| `ME_DEAD_HOSTS` | `imgbox.com,pixhost.to` | Hosts que disparan la regeneración |
+| `ME_REGEN_IMG_HOST` | *(vacío)* | Destino. Vacío = primer `img_host_N` que no esté muerto |
+| `ME_REGEN_SCREENS` | *(vacío)* | Nº de capturas. Vacío = `DEFAULT.screens` |
+| `ME_REGEN_KEEP_PNG` | `0` | `0` borra los PNG tras subirlos (deja ~cientos de KB en vez de ~13 MB) |
+| `ME_REGEN_DRY_RUN` | `0` | `1` enseña el cambio sin escribir en el tracker |
+| `ME_REGEN_IMG_SIZE` | `350` | Ancho de reserva si la etiqueta original no traía uno |
+| `ME_REGEN_STATE_DIR` | `.` | Dónde viven `mapeo_qbit.json` y `completados_regen.txt` |
+| `ME_REGEN_ALL` | `0` | `1` procesa todos los torrents del cliente e ignora `ID_START`/`ID_END` |
+| `ME_REGEN_LIMIT` | `0` | Tope por tirada (`0` = sin tope). Para ir en lotes |
+| `ME_REGEN_MAX_FALLOS` | `15` | Fallos seguidos tras los que se aborta la tirada |
+
+### Si administras otra instancia (esto le pasa a cualquiera)
+
+El fallo no es del tracker ni tuyo: **`config.py` de RawLoadrr venía con
+`img_host_1: 'imgbox'`**, así que toda galería subida con la suite acabó en el mismo
+host. El día que ese host cayó, se rompieron a la vez todas las descripciones que
+tuvieran imágenes suyas.
+
+Peor aún: **imgbox no lleva credencial**. `Prep.imgbox_upload()` sube de forma anónima
+con `pyimgbox`, así que no hay API key que borrar — la única manera de dejar de subir
+ahí es sacarlo de la lista `img_host_*`.
+
+Qué hacer, en este orden:
+
+1. **Deja de sangrar.** En tu `config.py` de RawLoadrr, comenta el host caído y sube
+   otro al puesto 1. Las plantillas del repo ya vienen así. De paso: si tienes
+   `img_host_3: 'pixhos'`, es una errata histórica (`upload_screens` compara con
+   `"pixhost"`), ese hueco nunca hizo nada.
+2. **Comprueba el alcance** sin tocar nada: `ME_REGEN_DRY_RUN=1`. Te dice cuántos
+   torrents tuyos están afectados y te enseña el cambio sin escribir en el tracker.
+3. **Repara en lotes.** `ME_REGEN_LIMIT=25` para la primera pasada; míralo en el
+   navegador; luego suelta el resto.
+
+⚠️ **Sólo puede arreglar torrents que sigas sembrando en tu cliente.** El id del
+tracker se saca del comentario del `.torrent`, que sólo está en el cliente que lo
+descargó. Si borraste el fichero, ese torrent no se puede regenerar desde aquí — y
+nadie más puede arreglarlo por ti, porque nadie más tiene tu copia. Por el mismo
+motivo, cada uploader afectado tiene que pasar esto en su propia máquina.
+
+### Uso
+
+Desde el menú: **Singularity → 3 (UNIT3D Editor) → 3 (Regenerar imágenes desde el
+origen)**. Suelto:
+
+```bash
+export ID_START=1 ID_END=6000
+export ME_REGEN_DRY_RUN=1        # ensayo en seco primero
+python3 05_image_regenerator.py
+```
+
+Reanudable vía `completados_regen.txt`. De propina repuebla `tmp/` con
+`MediaInfo.json` + `meta.json` + `DESCRIPTION.txt`, así que `02_indexer.py` vuelve
+a encontrar carpetas y `mapeo_maestro.json` deja de estar vacío.
+
+> ⚠️ Si `img_host_1` sigue siendo el host caído, la cascada de reserva de
+> `prep.py` puede volver a caer en él. `05` valida las URLs devueltas y aborta el
+> torrent si acaban en un host muerto, pero conviene degradarlo en la config.
+
+---
+
 ## 📦 Dependencias
 
 Las dependencias se instalan con el `requirements.txt` principal de `RaW_Suite`.

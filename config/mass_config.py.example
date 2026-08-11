@@ -11,20 +11,39 @@ from pathlib import Path
 try:
     from dotenv import load_dotenv
     _here = Path(__file__).resolve().parent
+    # Claves que se pasan por ejecución (el TUI las exporta al lanzar el
+    # subproceso, y el README documenta `export ID_START=…` para uso suelto).
+    # Éstas mandan sobre el fichero; el resto, no. Ver el comentario de abajo.
+    _RUNTIME_KEYS = ("ID_START", "ID_END", "ID_FILENAME", "EDIT_MODE",
+                     "ME_REGEN_ALL", "ME_REGEN_DRY_RUN", "ME_REGEN_KEEP_PNG",
+                     "ME_REGEN_SCREENS", "ME_REGEN_IMG_HOST", "ME_DEAD_HOSTS",
+                     "ME_REGEN_LIMIT", "ME_REGEN_MAX_FALLOS")
+    _runtime = {k: os.environ[k] for k in _RUNTIME_KEYS if k in os.environ}
+
     for _ep in [_here / ".env", _here / "../../.env", Path("/app/.env")]:
         if _ep.exists():
-            load_dotenv(_ep)
+            # override=True es obligatorio: el compose usa `env_file: ./config/.env`,
+            # así que los valores del .env quedan CONGELADOS en el entorno del
+            # contenedor cuando arranca. Sin override, load_dotenv respeta ese
+            # entorno viejo y cualquier cambio hecho desde el TUI (_write_env_key)
+            # es invisible para los procesos nuevos: el módulo seguiría apuntando
+            # al tracker anterior con la cookie y la API key anteriores.
+            load_dotenv(_ep, override=True)
             break
+
+    # …pero lo que venga explícito en esta ejecución vuelve a ganar.
+    os.environ.update(_runtime)
 except ImportError:
     pass
 
 # ─── 1. Credenciales y Tracker (namespace ME_) ────────────────────────────────
-BASE_URL          = os.getenv("ME_TRACKER_URL",         "https://nobs.rawsmoke.net")
+BASE_URL          = os.getenv("ME_TRACKER_URL",         "https://tu-tracker-unit3d.com")
 USERNAME          = os.getenv("ME_TRACKER_USERNAME",    "TuUsuario")
-COOKIE_NAME       = os.getenv("ME_TRACKER_COOKIE_NAME", "nuclear_order_bit_syndicate_session")
+COOKIE_NAME       = os.getenv("ME_TRACKER_COOKIE_NAME", "tu_tracker_session")
 COOKIE_VALUE      = os.getenv("ME_TRACKER_COOKIE",      "")
+TRACKER_API_KEY   = os.getenv("ME_TRACKER_API_KEY",     "")
 CUSTOM_USER_AGENT = os.getenv("ME_CUSTOM_USER_AGENT",   "undici")
-TRACKER_ABBREV    = os.getenv("ME_TRACKER_DEFAULT",     "NOBS")
+TRACKER_ABBREV    = os.getenv("ME_TRACKER_DEFAULT",     "TRACKER")
 
 # ─── 2. APIs de imágenes (namespace ME_) ──────────────────────────────────────
 IMGBB_API      = os.getenv("ME_IMGBB_API",     "")
@@ -65,7 +84,65 @@ FIRMAS_VIEJAS = [
 DELAY_MIN = float(os.getenv("ME_DELAY_MIN", "4.5"))
 DELAY_MAX = float(os.getenv("ME_DELAY_MAX", "7.5"))
 
+# ─── 7b. Regeneración de imágenes (05_image_regenerator) ─────────────────────
+# Hosts de imágenes muertos: si la descripción del tracker apunta a alguno de
+# ellos, el torrent entra en la cola de regeneración. Lista separada por comas.
+DEAD_HOSTS = [
+    h.strip().lower()
+    for h in os.getenv("ME_DEAD_HOSTS", "imgbox.com,pixhost.to").split(",")
+    if h.strip()
+]
+
+# Host de destino para las capturas nuevas. Vacío = usa el primer img_host_N de
+# RawLoadrr que no esté en DEAD_HOSTS. No introduce credenciales nuevas: las
+# API keys siguen viniendo de RawLoadrr/data/config.py.
+REGEN_IMG_HOST = os.getenv("ME_REGEN_IMG_HOST", "").strip().lower()
+
+# Nº de capturas por torrent. Vacío = usa DEFAULT.screens de RawLoadrr.
+REGEN_SCREENS = os.getenv("ME_REGEN_SCREENS", "").strip()
+
+# 1 = conserva los PNG en tmp/. 0 = los borra tras subirlos con éxito y deja
+# solo MediaInfo.json + meta.json + DESCRIPTION.txt (unos cientos de KB por
+# torrent en vez de ~13 MB).
+REGEN_KEEP_PNG = os.getenv("ME_REGEN_KEEP_PNG", "0").strip() not in ("0", "", "false", "False")
+
+# 1 = no escribe nada en el tracker; imprime el diff de la descripción.
+REGEN_DRY_RUN = os.getenv("ME_REGEN_DRY_RUN", "0").strip() not in ("0", "", "false", "False")
+
+# Ancho del [img=N] en el BBCode nuevo (mismo formato que COMMON.py).
+REGEN_IMG_SIZE = os.getenv("ME_REGEN_IMG_SIZE", "350").strip()
+
+# Directorio donde viven los ficheros de estado (mapeo_qbit.json,
+# completados_regen.txt). Por defecto el cwd, igual que 01-04.
+REGEN_STATE_DIR = os.getenv("ME_REGEN_STATE_DIR", "").strip() or "."
+
+# 1 = procesa TODO lo que haya en el cliente para este tracker e ignora
+# ID_START/ID_END. El mapa del cliente ya es la lista real de torrents del
+# usuario, así que los rangos sólo estorban.
+REGEN_ALL = os.getenv("ME_REGEN_ALL", "0").strip() not in ("0", "", "false", "False")
+
+# Tope de torrents por tirada (0 = sin tope). Sirve para hacer la primera
+# pasada en lotes pequeños y revisar el resultado antes de soltar las 3000.
+REGEN_LIMIT = int(os.getenv("ME_REGEN_LIMIT", "0") or 0)
+
+
 # ─── 8. Utilidades ────────────────────────────────────────────────────────────
+def filter_ids_by_range(ids):
+    """Filtra una lista de IDs (strings) por el rango ID_START/ID_END.
+
+    get_target_ids() depende de ids.txt (lo genera 01_scraper). 05 construye su
+    propia lista desde el cliente torrent, así que necesita el filtro suelto.
+    """
+    out = []
+    for tid in ids:
+        try:
+            if ID_INICIO <= int(tid) <= ID_FIN:
+                out.append(str(tid))
+        except (TypeError, ValueError):
+            continue
+    return sorted(out, key=int)
+
+
 def get_target_ids():
     """Retorna la lista final de IDs a procesar (de ids.txt filtrada por rango)."""
     ids = []

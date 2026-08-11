@@ -504,6 +504,84 @@ def _me_configure_tracker(me_cfg: dict) -> dict:
                 me_cfg = _me_load_config()
 
 
+def _me_regenerar_imagenes() -> None:
+    """Regenera las capturas desde el fichero original y republica los enlaces.
+
+    Es la salida para cuando el host de imágenes se cae: 04_image_resurrector
+    resube PNGs que ya estén en tmp, y si tmp está vacío no puede hacer nada.
+    05 los genera de cero desde el medio que sigue sembrándose en el cliente,
+    así que no depende de tmp. El mapeo id ↔ fichero sale del comentario que
+    UNIT3D deja dentro del .torrent, no de mapeo_maestro.json.
+    """
+    console.print()
+    console.print(Panel(
+        "Vuelve a generar las capturas con [bold]ffmpeg[/bold] desde el fichero original,\n"
+        "las sube a un host vivo y sustituye [bold]sólo[/bold] las imágenes muertas de la\n"
+        "descripción en el tracker. El resto del texto se reenvía intacto.\n\n"
+        "[dim]No necesita tmp ni mapeo_maestro.json: el id del torrent sale del\n"
+        "comentario del .torrent en el cliente. De paso repuebla tmp.[/dim]",
+        title="[bold cyan]REGENERAR IMÁGENES DESDE EL ORIGEN[/bold cyan]",
+        border_style="cyan",
+    ))
+
+    dead = os.getenv("ME_DEAD_HOSTS", "imgbox.com,pixhost.to")
+    console.print(f"[dim]Hosts considerados muertos: {dead}[/dim]")
+    nuevo_dead = Prompt.ask(
+        "Hosts muertos (separados por comas) [Enter para mantener]", default=""
+    ).strip()
+    if nuevo_dead:
+        _write_env_key("ME_DEAD_HOSTS", nuevo_dead)
+
+    # El mapa del cliente ya ES la lista real de torrents del usuario en este
+    # tracker, así que "todos" es lo natural; el rango queda como filtro opcional.
+    alcance = Prompt.ask(
+        "\n¿Qué procesamos?  [dim][1] todos los del cliente  ·  [2] un rango de IDs[/dim]",
+        choices=["1", "2"], default="1",
+    )
+
+    if alcance == "1":
+        os.environ["ME_REGEN_ALL"] = "1"
+        start = end = None
+        console.print("[dim]Se recorrerán todos los torrents de este tracker que haya en el cliente.[/dim]")
+    else:
+        os.environ["ME_REGEN_ALL"] = "0"
+        start = IntPrompt.ask(
+            "\nID del primer torrent\n  [dim](tracker.com/torrents/[bold]14[/bold])[/dim]",
+            default=int(os.getenv("ID_START", str(ID_INICIO))),
+        )
+        end = IntPrompt.ask(
+            "ID del último torrent",
+            default=int(os.getenv("ID_END", str(ID_FIN))),
+        )
+        _write_env_key("ID_START", str(start))
+        _write_env_key("ID_END",   str(end))
+        os.environ["ID_START"] = str(start)
+        os.environ["ID_END"]   = str(end)
+
+    seco = Prompt.ask(
+        "¿Ensayo en seco primero?  [dim](muestra el cambio sin tocar el tracker)[/dim]",
+        choices=["s", "n"], default="s",
+    )
+    os.environ["ME_REGEN_DRY_RUN"] = "1" if seco == "s" else "0"
+
+    if seco == "n":
+        ambito = "TODOS los torrents de este tracker" if start is None else f"los IDs {start}–{end}"
+        confirm = Prompt.ask(
+            f"[bold yellow]Se van a EDITAR las descripciones de {ambito} "
+            f"en el tracker. ¿Seguimos?[/bold yellow]",
+            choices=["s", "n"], default="n",
+        )
+        if confirm != "s":
+            console.print("[yellow]Cancelado.[/yellow]")
+            return
+
+    log.info(f"UNIT3D Regenerador: alcance={'todos' if start is None else f'{start}-{end}'}, "
+             f"dry_run={os.environ['ME_REGEN_DRY_RUN']}")
+    rc = _run(["python3", "extras/MASS-EDITION-UNIT3D/05_image_regenerator.py"])
+    if rc != 0:
+        console.print(f"[bold red]El regenerador terminó con código {rc}.[/bold red]")
+
+
 def unit3d_orchestrator():
     me_cfg = _me_check_essential_config(_me_load_config())
 
@@ -522,22 +600,26 @@ def unit3d_orchestrator():
             f"[cyan]Cookie   [/cyan]: {cookie_prev}\n"
             f"[cyan]ImgBB    [/cyan]: {cur_imgbb}    [cyan]PTScreens[/cyan]: {cur_pts}\n"
             f"[cyan]Modo edit[/cyan]: {cur_mode}\n\n"
-            "[C] Configuración del módulo  [dim](tracker, APIs, paths)[/dim]\n"
-            "[E] Configurar edición y lanzar\n"
+            "[1] Configuración del módulo  [dim](tracker, APIs, paths)[/dim]\n"
+            "[2] Configurar edición y lanzar  [dim](secuencia 01-04)[/dim]\n"
+            "[3] Regenerar imágenes desde el origen  [dim](host de imágenes caído)[/dim]\n"
             "[0] Volver",
             title="[bold green]ORQUESTADOR UNIT3D[/bold green]",
             border_style="green",
         ))
 
-        sel = Prompt.ask("Selección", choices=["c", "e", "0"])
+        sel = Prompt.ask("Selección", choices=["1", "2", "3", "0"])
 
         if sel == "0":
             break
 
-        elif sel == "c":
+        elif sel == "1":
             me_cfg = _me_configure_tracker(me_cfg)
 
-        elif sel == "e":
+        elif sel == "3":
+            _me_regenerar_imagenes()
+
+        elif sel == "2":
             # --- SELECCIÓN DE MODO ---
             console.print()
             console.print(Panel(
