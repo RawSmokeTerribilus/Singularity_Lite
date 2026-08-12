@@ -167,6 +167,58 @@ descargó. Si borraste el fichero, ese torrent no se puede regenerar desde aquí
 nadie más puede arreglarlo por ti, porque nadie más tiene tu copia. Por el mismo
 motivo, cada uploader afectado tiene que pasar esto en su propia máquina.
 
+### El .env se completa solo
+
+Un `.env` que ya existe **no se regenera al reconstruir la imagen** — es un fichero tuyo,
+montado dentro del contenedor. Quien viene de una versión anterior se quedaba sin las claves
+nuevas: heredaba los valores por defecto del código sin enterarse y, peor, no podía cambiarlos
+porque ni siquiera aparecían en el fichero.
+
+Al arrancar, el módulo repasa tu `.env` y **añade sólo lo que falte**, con su comentario y su
+valor por defecto:
+
+```
+🔧 .env completado con 9 clave(s) nueva(s): ME_REGEN_IMG_HOST, ME_REGEN_SCREENS, …
+```
+
+Nunca toca un valor que ya esté escrito (aunque esté vacío), es idempotente —la segunda vez no
+hace nada— y escribe in situ, sin sustituir el fichero, porque suele ser un bind-mount de
+fichero único y reemplazarlo rompería el inodo dentro del contenedor. Si el `.env` no existe,
+lo crea.
+
+### Las banderas se leen en estricto
+
+`1/0`, `true/false`, `yes/no`, `si/no`, `on/off` — y lo que no se reconozca **avisa y se toma
+como desactivado**, en vez de decidir en silencio:
+
+```
+⚠️  ME_REGEN_DRY_RUN='patata' no se entiende; lo trato como desactivado. Usa 1/0.
+```
+
+Antes la regla era "cualquier cosa que no sea `0` es verdadero", así que un `n` o un `no` se
+leían como **verdadero** y encerraban la herramienta en simulacro dijeras lo que dijeras.
+
+### Modo de ejecución: usa los flags
+
+`--real` / `--dry-run` **mandan sobre cualquier `.env`**. El modo viajaba sólo en
+`ME_REGEN_DRY_RUN`, y un valor viejo en el fichero podía imponerse sobre lo que acababas de
+responder: hubo quien confirmó *"sí, edita el tracker"* y se pasó la tirada entera en simulacro
+sin escribir nada. Un argumento no lo pisa ningún fichero.
+
+```bash
+python3 05_image_regenerator.py --real  --todos   # edita de verdad
+python3 05_image_regenerator.py --dry-run --todos # sólo enseña el cambio
+```
+
+Si te quedas atascado en simulacro, mira la cabecera — siempre dice en cuál estás:
+
+```
+⚙️  Modo    : REAL — se editará el tracker
+⚙️  Modo    : SIMULACRO (no se escribe nada)
+```
+
+Arreglo directo: lanza con `--real`, o quita `ME_REGEN_DRY_RUN` de tu `.env`.
+
 ### Uso
 
 Desde el menú: **Singularity → 3 (UNIT3D Editor) → 3 (Regenerar imágenes desde el

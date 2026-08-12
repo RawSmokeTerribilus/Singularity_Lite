@@ -46,9 +46,59 @@ RAWLOADRR_DIR = os.path.join(SUITE_ROOT, "RawLoadrr")
 if RAWLOADRR_DIR not in sys.path:
     sys.path.insert(0, RAWLOADRR_DIR)
 
-MAPA_QBIT   = os.path.join(REGEN_STATE_DIR, "mapeo_qbit.json")
+# El estado va por tracker: los ids son de un tracker concreto, así que un
+# completados_regen.txt compartido hacía que al cambiar de tracker se saltaran
+# torrents distintos que casualmente tienen el mismo id.
+_SUF = (TRACKER_ABBREV or "TRACKER").strip().upper()
+MAPA_QBIT   = os.path.join(REGEN_STATE_DIR, f"mapeo_qbit_{_SUF}.json")
 MAPA_MAESTRO = os.path.join(REGEN_STATE_DIR, "mapeo_maestro.json")
-COMPLETADOS = os.path.join(REGEN_STATE_DIR, "completados_regen.txt")
+COMPLETADOS = os.path.join(REGEN_STATE_DIR, f"completados_regen_{_SUF}.txt")
+
+# Ficheros de antes de la separación por tracker.
+COMPLETADOS_LEGADO = os.path.join(REGEN_STATE_DIR, "completados_regen.txt")
+
+
+def _migrar_estado_legado():
+    """Adopta el completados_regen.txt sin sufijo, si lo hay.
+
+    Sin esto, la primera tirada tras el cambio de nombre empezaría con el
+    marcador vacío y volvería a recorrer todo lo ya hecho.
+    """
+    if os.path.exists(COMPLETADOS) or not os.path.exists(COMPLETADOS_LEGADO):
+        return
+    shutil.copy(COMPLETADOS_LEGADO, COMPLETADOS)
+    n = sum(1 for l in open(COMPLETADOS, encoding="utf-8") if l.strip())
+    print(f"♻️  Adoptado el marcador antiguo como {os.path.basename(COMPLETADOS)} "
+          f"({n} ids). Si esos ids NO son de {_SUF}, borra ese fichero y relanza.")
+
+# ─── Modo de ejecución: los flags de la línea de órdenes MANDAN ──────────────
+# El modo viajaba sólo en ME_REGEN_DRY_RUN, y un valor viejo en el .env podía
+# imponerse sobre la respuesta del usuario (load_dotenv(override=True) pisa el
+# entorno del proceso). Resultado real: alguien confirmó "sí, edita el tracker"
+# y la tirada entera se ejecutó en simulacro sin tocar nada. Un argumento no lo
+# puede pisar ningún fichero de configuración, así que el modo va por argumento
+# y el entorno queda sólo como respaldo para uso suelto.
+_ARGS = set(sys.argv[1:])
+
+
+def _resolver_dry_run():
+    if _ARGS & {"--real", "--no-dry-run"}:
+        return False
+    if _ARGS & {"--dry-run", "--seco", "--simulacro"}:
+        return True
+    return REGEN_DRY_RUN
+
+
+def _resolver_all():
+    if "--all" in _ARGS or "--todos" in _ARGS:
+        return True
+    if "--rango" in _ARGS or "--range" in _ARGS:
+        return False
+    return REGEN_ALL
+
+
+DRY_RUN = _resolver_dry_run()
+TODOS   = _resolver_all()
 
 # Fallos seguidos tras los que se aborta una tirada larga.
 MAX_FALLOS_SEGUIDOS = int(os.getenv("ME_REGEN_MAX_FALLOS", "15"))
@@ -311,14 +361,21 @@ def regenerar_imagenes(media_path, uuid, screens, img_host, rl_config, reanudar)
     try:
         # exportInfo escribe MediaInfo.json, que screenshots() necesita sí o sí.
         prep.exportInfo(media_path, os.path.isdir(media_path), uuid, base_dir, export_text=True)
-        prep.screenshots(media_path, filename, uuid, base_dir, meta, num_screens=screens)
+
+        # Se piden 2 de más: prep descarta capturas negras o diminutas y además
+        # borra la más pequeña del lote, así que pedir justas devuelve de menos
+        # (visto: 10 pedidas → 9 subidas) y la galería encogía en silencio.
+        prep.screenshots(media_path, filename, uuid, base_dir, meta, num_screens=screens + 2)
 
         disponibles = sorted(glob.glob(os.path.join(carpeta, f"{filename}-*.png")))
         if not disponibles:
             return None, "ffmpeg no generó ninguna captura"
 
+        # Sólo se suben las que se van a usar: subir el sobrante gastaría cuota
+        # del host de imágenes para nada.
+        elegidas = [os.path.basename(x) for x in disponibles[:screens]]
         image_list, _i = prep.upload_screens(
-            meta, len(disponibles), 1, 0, len(disponibles), [], {}
+            meta, len(elegidas), 1, 0, len(elegidas), elegidas, {}
         )
     finally:
         os.chdir(cwd)
@@ -665,6 +722,18 @@ def verificar(session, site_base, tid, image_list):
 # 🚀 PROCESO POR TORRENT
 # ==========================================
 def procesar(tid, media_root, session, site_base, rl_config, screens, img_host):
+    # Primero lo barato: una llamada a la API dice si hay algo que arreglar.
+    # Antes se pedía el formulario de edición (HTML pesado) y se recorría el
+    # disco buscando el vídeo ANTES de saberlo, así que cada re-pasada sobre
+    # torrents ya sanos costaba dos peticiones y un walk del sistema de ficheros
+    # para nada. En una tirada reanudada eso es casi todo el trabajo.
+    desc_actual, err = leer_descripcion(session, site_base, tid, BeautifulSoup("", "html.parser"))
+    if err:
+        return False, err
+
+    if not any(dead in desc_actual.lower() for dead in DEAD_HOSTS):
+        return True, "ya está limpio"
+
     media_path = elegir_fichero(media_root)
     if not media_path:
         return False, "no hay ningún fichero de vídeo en la ruta del torrent"
@@ -672,13 +741,6 @@ def procesar(tid, media_root, session, site_base, rl_config, screens, img_host):
     form, soup, edit_url, err = leer_formulario(session, site_base, tid)
     if err:
         return False, err
-
-    desc_actual, err = leer_descripcion(session, site_base, tid, soup)
-    if err:
-        return False, err
-
-    if not any(dead in desc_actual.lower() for dead in DEAD_HOSTS):
-        return True, "ya está limpio"
 
     uuid = os.path.basename(os.path.normpath(media_root))
     carpeta = os.path.join(RAWLOADRR_DIR, "tmp", uuid)
@@ -708,12 +770,14 @@ def procesar(tid, media_root, session, site_base, rl_config, screens, img_host):
     if _texto_sin_imagenes(desc_nueva) != _texto_sin_imagenes(desc_actual):
         return False, "el texto de fuera de las imágenes cambió — abortado"
 
-    if REGEN_DRY_RUN:
-        print(f"\n───── DRY-RUN id {tid} — {n} imagen(es) sustituida(s) ─────")
+    aviso = "" if len(image_list) == n else f"  ⚠️  {n} muertas pero sólo {len(image_list)} nuevas"
+
+    if DRY_RUN:
+        print(f"\n───── SIMULACRO id {tid} — {n} etiqueta(s) → {len(image_list)} imagen(es){aviso} ─────")
         print(f"ANTES : {desc_actual[:400]}")
         print(f"AHORA : {desc_nueva[:400]}")
         print("─" * 60)
-        return True, f"DRY-RUN: {n} imagen(es) listas (no se ha escrito nada)"
+        return True, f"SIMULACRO: {n} etiqueta(s) → {len(image_list)} imagen(es), nada escrito{aviso}"
 
     ok, msg = enviar(session, form, construir_payload(form, desc_nueva), site_base, edit_url)
     if not ok:
@@ -749,7 +813,7 @@ def procesar(tid, media_root, session, site_base, rl_config, screens, img_host):
             except OSError:
                 pass
 
-    return True, f"{n} imagen(es) regeneradas y publicadas"
+    return True, f"{n} etiqueta(s) → {len(image_list)} imagen(es) publicadas{aviso}"
 
 
 # ==========================================
@@ -770,10 +834,9 @@ def main():
     img_host = _elegir_img_host(rl_config)
 
     print(f"🌐 Tracker : {site_base}  [{TRACKER_ABBREV}]")
-    print(f"🖼️  Host    : {img_host}   ({screens} capturas por torrent)")
+    print(f"🖼️  Host    : {img_host}   (capturas: las que haga falta reponer en cada torrent)")
+    print(f"⚙️  Modo    : {'SIMULACRO (no se escribe nada)' if DRY_RUN else 'REAL — se editará el tracker'}")
     print(f"☠️  Muertos : {', '.join(DEAD_HOSTS)}")
-    if REGEN_DRY_RUN:
-        print("🧪 DRY-RUN activo: no se escribirá nada en el tracker.")
 
     update_status("UNIT3D", "Regeneración de Imágenes", "PROCESSING",
                   details="Mapeando torrents desde el cliente")
@@ -789,8 +852,9 @@ def main():
         return 1
     _guardar_json(MAPA_QBIT, mapa)
 
+    _migrar_estado_legado()
     completados = _leer_completados()
-    if REGEN_ALL:
+    if TODOS:
         candidatos = sorted(mapa.keys(), key=int)
         ambito = "todo el cliente"
     else:
@@ -836,7 +900,7 @@ def main():
             ok_n += 1
             seguidos = 0
             print(f"✨ {mensaje}")
-            if not REGEN_DRY_RUN:
+            if not DRY_RUN:
                 _marcar_completado(tid)
         else:
             fail_n += 1
@@ -861,7 +925,7 @@ def main():
 
     quedan = len(pendientes) - (ok_n + fail_n)
     print(f"\n✅ Hechos: {ok_n}   ❌ Fallos: {fail_n}" + (f"   ⏸️  Sin tocar: {quedan}" if quedan else ""))
-    if not REGEN_DRY_RUN:
+    if not DRY_RUN:
         print(f"   Reanudable: {COMPLETADOS}")
     update_status("UNIT3D", "Regeneración de Imágenes", "COMPLETED", progress=100,
                   details=f"{ok_n} ok / {fail_n} fallos")

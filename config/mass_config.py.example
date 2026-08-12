@@ -8,6 +8,87 @@
 import os
 from pathlib import Path
 
+# ─── 0. Autocuración del .env ────────────────────────────────────────────────
+# Un .env existente NO se regenera al reconstruir la imagen: es un fichero del
+# host montado dentro. Así que quien viene de una versión anterior se queda sin
+# las claves nuevas y hereda los valores por defecto del código sin enterarse —
+# y peor, sin poder cambiarlos desde el .env porque ni siquiera aparecen.
+#
+# ENV_DEFAULTS es la lista de claves que este módulo espera. ensure_env_keys()
+# añade SÓLO las que falten, nunca toca un valor ya escrito, y no hace nada si
+# están todas: es idempotente, se puede llamar en cada arranque.
+ENV_DEFAULTS = [
+    ("ME_DEAD_HOSTS",        "imgbox.com,pixhost.to", "Hosts de imágenes caídos que disparan la regeneración"),
+    ("ME_REGEN_IMG_HOST",    "",                      "Destino de las capturas. Vacío = primer img_host_N vivo de RawLoadrr"),
+    ("ME_REGEN_SCREENS",     "",                      "Nº de capturas. Vacío = tantas como imágenes haya que reponer"),
+    ("ME_REGEN_KEEP_PNG",    "0",                     "1 conserva los PNG en tmp; 0 los borra tras subirlos"),
+    ("ME_REGEN_DRY_RUN",     "0",                     "1 = simulacro. Los flags --real/--dry-run mandan sobre esto"),
+    ("ME_REGEN_IMG_SIZE",    "350",                   "Ancho del [img=N] si la etiqueta original no traía uno"),
+    ("ME_REGEN_STATE_DIR",   "",                      "Dónde viven mapeo_qbit_*.json y completados_regen_*.txt. Vacío = directorio actual"),
+    ("ME_REGEN_ALL",         "0",                     "1 = procesa todo el cliente e ignora ID_START/ID_END"),
+    ("ME_REGEN_LIMIT",       "0",                     "Tope de torrents por tirada. 0 = sin tope"),
+    ("ME_REGEN_MAX_FALLOS",  "15",                    "Fallos seguidos tras los que se aborta la tirada"),
+]
+
+
+def _localizar_env():
+    """Mismo orden de búsqueda que el cargador de abajo."""
+    aqui = Path(__file__).resolve().parent
+    for ruta in (aqui / ".env", aqui / "../../.env", Path("/app/.env")):
+        if ruta.exists():
+            return ruta.resolve()
+    return (aqui / "../../.env").resolve()
+
+
+def ensure_env_keys(env_path=None, verbose=True):
+    """Añade al .env las claves que falten. Devuelve la lista de añadidas.
+
+    - No modifica ningún valor existente (ni siquiera si está vacío).
+    - Idempotente: la segunda llamada no añade nada.
+    - Escribe in situ (r+ y truncate), nunca os.replace: el .env suele ser un
+      bind-mount de fichero único y sustituirlo rompe el inodo del contenedor.
+    - Si el fichero no existe, lo crea.
+    """
+    ruta = Path(env_path) if env_path else _localizar_env()
+    try:
+        texto = ruta.read_text(encoding="utf-8") if ruta.exists() else ""
+    except OSError:
+        return []
+
+    presentes = set()
+    for linea in texto.splitlines():
+        limpia = linea.strip()
+        if not limpia or limpia.startswith("#") or "=" not in limpia:
+            continue
+        presentes.add(limpia.split("=", 1)[0].strip())
+
+    faltan = [(k, v, c) for k, v, c in ENV_DEFAULTS if k not in presentes]
+    if not faltan:
+        return []
+
+    nuevo = texto
+    if nuevo and not nuevo.endswith("\n"):
+        nuevo += "\n"
+    nuevo += "\n# --- Mass Edition · regeneración de imágenes (añadido automáticamente) ---\n"
+    for k, v, c in faltan:
+        nuevo += f"# {c}\n{k}={v}\n"
+
+    try:
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+        with open(ruta, "r+" if ruta.exists() else "w", encoding="utf-8") as f:
+            f.write(nuevo)
+            f.truncate()
+    except OSError as e:
+        if verbose:
+            print(f"⚠️  No se pudo completar {ruta}: {e}")
+        return []
+
+    if verbose:
+        print(f"🔧 {ruta.name} completado con {len(faltan)} clave(s) nueva(s): "
+              + ", ".join(k for k, _v, _c in faltan))
+    return [k for k, _v, _c in faltan]
+
+
 try:
     from dotenv import load_dotenv
     _here = Path(__file__).resolve().parent
@@ -31,10 +112,39 @@ try:
             load_dotenv(_ep, override=True)
             break
 
+    # Completar el .env con las claves nuevas y recargar, para que un fichero
+    # heredado de una versión anterior no deje al usuario sin poder configurarlas.
+    try:
+        if ensure_env_keys(_ep if '_ep' in dir() else None):
+            load_dotenv(_ep, override=True)
+    except Exception:
+        pass
+
     # …pero lo que venga explícito en esta ejecución vuelve a ganar.
     os.environ.update(_runtime)
 except ImportError:
     pass
+
+# ─── 0b. Lectura estricta de banderas ────────────────────────────────────────
+# "cualquier cosa que no sea 0 es verdadero" es una trampa: un valor como "n",
+# "no" o "false" se leía como VERDADERO y dejaba la herramienta encerrada en
+# simulacro pasara lo que pasara. Aquí sólo valen tokens reconocidos, y lo que
+# no se reconozca avisa y se toma como falso en vez de decidir en silencio.
+_CIERTO = {"1", "true", "yes", "y", "on", "si", "sí", "s", "t"}
+_FALSO  = {"0", "false", "no", "n", "off", "", "none", "null", "f"}
+
+
+def flag(nombre, por_defecto="0"):
+    crudo = os.getenv(nombre, por_defecto)
+    v = str(crudo).strip().strip("'\"").lower()
+    if v in _CIERTO:
+        return True
+    if v in _FALSO:
+        return False
+    print(f"⚠️  {nombre}={crudo!r} no se entiende; lo trato como desactivado. "
+          f"Usa 1/0.")
+    return False
+
 
 # ─── 1. Credenciales y Tracker (namespace ME_) ────────────────────────────────
 BASE_URL          = os.getenv("ME_TRACKER_URL",         "https://tu-tracker-unit3d.com")
@@ -104,10 +214,10 @@ REGEN_SCREENS = os.getenv("ME_REGEN_SCREENS", "").strip()
 # 1 = conserva los PNG en tmp/. 0 = los borra tras subirlos con éxito y deja
 # solo MediaInfo.json + meta.json + DESCRIPTION.txt (unos cientos de KB por
 # torrent en vez de ~13 MB).
-REGEN_KEEP_PNG = os.getenv("ME_REGEN_KEEP_PNG", "0").strip() not in ("0", "", "false", "False")
+REGEN_KEEP_PNG = flag("ME_REGEN_KEEP_PNG", "0")
 
 # 1 = no escribe nada en el tracker; imprime el diff de la descripción.
-REGEN_DRY_RUN = os.getenv("ME_REGEN_DRY_RUN", "0").strip() not in ("0", "", "false", "False")
+REGEN_DRY_RUN = flag("ME_REGEN_DRY_RUN", "0")
 
 # Ancho del [img=N] en el BBCode nuevo (mismo formato que COMMON.py).
 REGEN_IMG_SIZE = os.getenv("ME_REGEN_IMG_SIZE", "350").strip()
@@ -119,7 +229,7 @@ REGEN_STATE_DIR = os.getenv("ME_REGEN_STATE_DIR", "").strip() or "."
 # 1 = procesa TODO lo que haya en el cliente para este tracker e ignora
 # ID_START/ID_END. El mapa del cliente ya es la lista real de torrents del
 # usuario, así que los rangos sólo estorban.
-REGEN_ALL = os.getenv("ME_REGEN_ALL", "0").strip() not in ("0", "", "false", "False")
+REGEN_ALL = flag("ME_REGEN_ALL", "0")
 
 # Tope de torrents por tirada (0 = sin tope). Sirve para hacer la primera
 # pasada en lotes pequeños y revisar el resultado antes de soltar las 3000.

@@ -34,6 +34,23 @@ from rich.live import Live
 from rich.align import Align
 from rich.rule import Rule
 
+# --- .env: el fichero manda sobre el entorno del contenedor -----------------
+# El compose usa `env_file: ./config/.env`, así que los valores del .env quedan
+# CONGELADOS en el entorno del contenedor al arrancarlo. _write_env_key() escribe
+# en el fichero y en os.environ del proceso actual, pero el siguiente arranque
+# vuelve a leer el entorno viejo: la configuración del tracker parecía no
+# guardarse nunca y había que reconfigurarla en cada lanzamiento.
+# override=True hace que el fichero sea la fuente de verdad.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    from pathlib import Path as _Path
+    for _envp in (_Path(__file__).resolve().parent / ".env", _Path("/app/.env")):
+        if _envp.exists():
+            _load_dotenv(_envp, override=True)
+            break
+except ImportError:
+    pass
+
 from singularity_config import GOD_PHRASES, MSG_NUEVO, ID_INICIO, ID_FIN, LOGS_DIR, BASE_URL, COOKIE_VALUE, IMGBB_API, PTSCREENS_API  # noqa: F401 – BASE_URL/COOKIE_VALUE/IMGBB_API/PTSCREENS_API usados en _ensure_credentials (SING_* namespace)
 
 console = Console()
@@ -540,11 +557,11 @@ def _me_regenerar_imagenes() -> None:
     )
 
     if alcance == "1":
-        os.environ["ME_REGEN_ALL"] = "1"
+        _write_env_key("ME_REGEN_ALL", "1")
         start = end = None
         console.print("[dim]Se recorrerán todos los torrents de este tracker que haya en el cliente.[/dim]")
     else:
-        os.environ["ME_REGEN_ALL"] = "0"
+        _write_env_key("ME_REGEN_ALL", "0")
         start = IntPrompt.ask(
             "\nID del primer torrent\n  [dim](tracker.com/torrents/[bold]14[/bold])[/dim]",
             default=int(os.getenv("ID_START", str(ID_INICIO))),
@@ -562,7 +579,9 @@ def _me_regenerar_imagenes() -> None:
         "¿Ensayo en seco primero?  [dim](muestra el cambio sin tocar el tracker)[/dim]",
         choices=["s", "n"], default="s",
     )
-    os.environ["ME_REGEN_DRY_RUN"] = "1" if seco == "s" else "0"
+    # _write_env_key escribe en el .env Y en os.environ: así el fichero y el
+    # entorno no pueden discrepar, pase lo que pase con el orden de carga.
+    _write_env_key("ME_REGEN_DRY_RUN", "1" if seco == "s" else "0")
 
     if seco == "n":
         ambito = "TODOS los torrents de este tracker" if start is None else f"los IDs {start}–{end}"
@@ -577,7 +596,11 @@ def _me_regenerar_imagenes() -> None:
 
     log.info(f"UNIT3D Regenerador: alcance={'todos' if start is None else f'{start}-{end}'}, "
              f"dry_run={os.environ['ME_REGEN_DRY_RUN']}")
-    rc = _run(["python3", "extras/MASS-EDITION-UNIT3D/05_image_regenerator.py"])
+    # El modo va como argumento, no sólo en el entorno: un .env viejo no puede
+    # convertir un "sí, edita" en un simulacro.
+    flags = ["--dry-run" if seco == "s" else "--real",
+             "--todos" if start is None else "--rango"]
+    rc = _run(["python3", "extras/MASS-EDITION-UNIT3D/05_image_regenerator.py", *flags])
     if rc != 0:
         console.print(f"[bold red]El regenerador terminó con código {rc}.[/bold red]")
 
