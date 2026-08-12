@@ -167,6 +167,21 @@ descargó. Si borraste el fichero, ese torrent no se puede regenerar desde aquí
 nadie más puede arreglarlo por ti, porque nadie más tiene tu copia. Por el mismo
 motivo, cada uploader afectado tiene que pasar esto en su propia máquina.
 
+### Si tocas una plantilla de `config/`, vuelca los defaults
+
+`final-user-install.sh` lleva las plantillas **embebidas** para poder funcionar de una pieza.
+Son copias, no referencias: si cambias un `config/*.example` y no las regeneras, cada instalación
+nueva seguirá naciendo con la versión vieja.
+
+```bash
+make sync-defaults                      # vuelca config/*.example al instalador
+python3 sync-embedded-defaults.py --check   # no escribe; sale 1 si hay desfase (CI)
+```
+
+Ya mordió una vez: el `config.py` embebido conservó `img_host_1: 'imgbox'` y un `mass_config.py`
+sin las claves `ME_REGEN_*`, así que una instalación limpia reproducía la caída de imgbox y
+además petaba con `ImportError` al entrar en la opción 3.
+
 ### El .env se completa solo
 
 Un `.env` que ya existe **no se regenera al reconstruir la imagen** — es un fichero tuyo,

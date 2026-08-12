@@ -18,6 +18,7 @@ sinopsis, tráiler, banner, firma) se reenvía byte a byte tal cual estaba.
 import sys, os, re, json, time, glob, shutil, random
 import urllib.parse
 from datetime import datetime
+from pathlib import Path
 
 _AQUI = os.path.dirname(os.path.abspath(__file__))
 
@@ -29,11 +30,144 @@ if sys.path[:1] != [_AQUI]:
 sys.path.append(os.path.abspath(os.path.join(_AQUI, '../..')))
 
 from core.status_manager import update_status
-from config import (BASE_URL, COOKIE_NAME, COOKIE_VALUE, CUSTOM_USER_AGENT,
-                    TRACKER_ABBREV, TRACKER_API_KEY, DELAY_MIN, DELAY_MAX,
-                    DEAD_HOSTS, REGEN_IMG_HOST, REGEN_SCREENS, REGEN_KEEP_PNG,
-                    REGEN_DRY_RUN, REGEN_IMG_SIZE, REGEN_STATE_DIR, REGEN_ALL, REGEN_LIMIT,
-                    filter_ids_by_range, ID_INICIO, ID_FIN)
+
+# config.py es un fichero DEL USUARIO (montado desde config/mass_config.py) y no
+# se regenera al reconstruir la imagen: quien viene de una versión anterior tiene
+# uno viejo. Un `from config import (…)` rígido se rompería con ImportError en
+# cuanto pidiera una clave que su fichero no define. Así que se lee con getattr y
+# valores por defecto propios: este script funciona con cualquier config.py que
+# al menos traiga las credenciales del tracker.
+import config as _cfg
+
+
+def _cfg_get(nombre, por_defecto=None):
+    return getattr(_cfg, nombre, por_defecto)
+
+
+# La barra final convierte {base}/torrents/… en //torrents/… → 404.
+BASE_URL          = str(_cfg_get("BASE_URL", "") or "").rstrip("/")
+COOKIE_NAME       = _cfg_get("COOKIE_NAME", "")
+COOKIE_VALUE      = _cfg_get("COOKIE_VALUE", "")
+CUSTOM_USER_AGENT = _cfg_get("CUSTOM_USER_AGENT", "undici")
+TRACKER_ABBREV    = _cfg_get("TRACKER_ABBREV", os.getenv("ME_TRACKER_DEFAULT", "TRACKER"))
+TRACKER_API_KEY   = _cfg_get("TRACKER_API_KEY", os.getenv("ME_TRACKER_API_KEY", ""))
+DELAY_MIN         = float(_cfg_get("DELAY_MIN", 4.5))
+DELAY_MAX         = float(_cfg_get("DELAY_MAX", 7.5))
+ID_INICIO         = int(_cfg_get("ID_INICIO", os.getenv("ID_START", 1)))
+ID_FIN            = int(_cfg_get("ID_FIN", os.getenv("ID_END", 10**9)))
+
+filter_ids_by_range = _cfg_get("filter_ids_by_range")
+if filter_ids_by_range is None:
+    def filter_ids_by_range(ids):
+        out = []
+        for tid in ids:
+            try:
+                if ID_INICIO <= int(tid) <= ID_FIN:
+                    out.append(str(tid))
+            except (TypeError, ValueError):
+                continue
+        return sorted(out, key=int)
+
+# ─── Ajustes propios: .env autocurado + banderas estrictas ───────────────────
+# Viven aquí, en código que SÍ viaja en la imagen, y no en el config.py del
+# usuario: así una instalación antigua recibe el arreglo con sólo reconstruir.
+ENV_DEFAULTS = [
+    ("ME_DEAD_HOSTS",       "imgbox.com,pixhost.to", "Hosts de imágenes caídos que disparan la regeneración"),
+    ("ME_REGEN_IMG_HOST",   "",   "Destino de las capturas. Vacío = primer img_host_N vivo de RawLoadrr"),
+    ("ME_REGEN_SCREENS",    "",   "Nº de capturas. Vacío = tantas como haya que reponer"),
+    ("ME_REGEN_KEEP_PNG",   "0",  "1 conserva los PNG en tmp; 0 los borra tras subirlos"),
+    ("ME_REGEN_DRY_RUN",    "0",  "1 = simulacro. Los flags --real/--dry-run mandan sobre esto"),
+    ("ME_REGEN_IMG_SIZE",   "350","Ancho del [img=N] si la etiqueta original no traía uno"),
+    ("ME_REGEN_STATE_DIR",  "",   "Dónde viven mapeo_qbit_*.json y completados_regen_*.txt"),
+    ("ME_REGEN_ALL",        "0",  "1 = procesa todo el cliente e ignora ID_START/ID_END"),
+    ("ME_REGEN_LIMIT",      "0",  "Tope de torrents por tirada. 0 = sin tope"),
+    ("ME_REGEN_MAX_FALLOS", "15", "Fallos seguidos tras los que se aborta la tirada"),
+]
+
+_CIERTO = {"1", "true", "yes", "y", "on", "si", "sí", "s", "t"}
+_FALSO  = {"0", "false", "no", "n", "off", "", "none", "null", "f"}
+
+
+def flag(nombre, por_defecto="0"):
+    """Sólo tokens reconocidos. Antes valía "todo lo que no sea 0 es cierto", y
+    un "n" se leía como VERDADERO: la herramienta se quedaba en simulacro."""
+    crudo = os.getenv(nombre, por_defecto)
+    v = str(crudo).strip().strip("'\"").lower()
+    if v in _CIERTO:
+        return True
+    if v in _FALSO:
+        return False
+    print(f"⚠️  {nombre}={crudo!r} no se entiende; lo trato como desactivado. Usa 1/0.")
+    return False
+
+
+def _localizar_env():
+    for ruta in (Path(_AQUI) / ".env", Path(_AQUI) / "../../.env", Path("/app/.env")):
+        if ruta.exists():
+            return ruta.resolve()
+    return (Path(_AQUI) / "../../.env").resolve()
+
+
+def ensure_env_keys(env_path=None, verbose=True):
+    """Añade al .env sólo las claves que falten. Idempotente.
+
+    Un .env existente no se regenera al reconstruir la imagen — es un fichero
+    del host — así que sin esto una instalación antigua nunca ve las opciones
+    nuevas. Escribe in situ: sustituir el fichero rompería el bind-mount.
+    """
+    ruta = Path(env_path) if env_path else _localizar_env()
+    try:
+        texto = ruta.read_text(encoding="utf-8") if ruta.exists() else ""
+    except OSError:
+        return []
+
+    presentes = set()
+    for linea in texto.splitlines():
+        limpia = linea.strip()
+        if limpia and not limpia.startswith("#") and "=" in limpia:
+            presentes.add(limpia.split("=", 1)[0].strip())
+
+    faltan = [(k, v, c) for k, v, c in ENV_DEFAULTS if k not in presentes]
+    if not faltan:
+        return []
+
+    nuevo = texto + ("" if not texto or texto.endswith("\n") else "\n")
+    nuevo += "\n# --- Mass Edition · regeneración de imágenes (añadido automáticamente) ---\n"
+    for k, v, c in faltan:
+        nuevo += f"# {c}\n{k}={v}\n"
+    try:
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+        with open(ruta, "r+" if ruta.exists() else "w", encoding="utf-8") as f:
+            f.write(nuevo); f.truncate()
+    except OSError as e:
+        if verbose:
+            print(f"⚠️  No se pudo completar {ruta}: {e}")
+        return []
+    if verbose:
+        print(f"🔧 {ruta.name} completado con {len(faltan)} clave(s): "
+              + ", ".join(k for k, _v, _c in faltan))
+    return [k for k, _v, _c in faltan]
+
+
+_ENV_PATH = _localizar_env()
+if ensure_env_keys(_ENV_PATH):
+    try:
+        from dotenv import load_dotenv as _ld
+        _ld(_ENV_PATH, override=False)   # sólo rellena lo que no esté ya en el entorno
+    except ImportError:
+        pass
+
+DEAD_HOSTS = [h.strip().lower()
+              for h in os.getenv("ME_DEAD_HOSTS", "imgbox.com,pixhost.to").split(",")
+              if h.strip()]
+REGEN_IMG_HOST  = os.getenv("ME_REGEN_IMG_HOST", "").strip().lower()
+REGEN_SCREENS   = os.getenv("ME_REGEN_SCREENS", "").strip()
+REGEN_IMG_SIZE  = os.getenv("ME_REGEN_IMG_SIZE", "350").strip()
+REGEN_STATE_DIR = os.getenv("ME_REGEN_STATE_DIR", "").strip() or "."
+REGEN_LIMIT     = int(os.getenv("ME_REGEN_LIMIT", "0") or 0)
+REGEN_KEEP_PNG  = flag("ME_REGEN_KEEP_PNG", "0")
+REGEN_DRY_RUN   = flag("ME_REGEN_DRY_RUN", "0")
+REGEN_ALL       = flag("ME_REGEN_ALL", "0")
 
 import requests
 from bs4 import BeautifulSoup

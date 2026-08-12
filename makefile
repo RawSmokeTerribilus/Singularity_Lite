@@ -1,7 +1,7 @@
 SCRIPTS_SRC := RawLoadrr/src/trackers
 WORK_TRACKERS := work_data/trackers
 
-.PHONY: build up down restart logs attach shell install prep check
+.PHONY: build up down restart logs attach shell install prep check sync-defaults
 
 # --- 1. Orquestación ---
 # No hay `pull`: Singularity Lite no publica imagen. Se construye en tu máquina,
@@ -14,6 +14,12 @@ up: prep
 
 down:
 	docker compose down
+
+# Las plantillas de config van embebidas en final-user-install.sh; son copias.
+# Tras tocar cualquier config/*.example hay que volcarlas o las instalaciones
+# nuevas seguirán naciendo con la versión vieja.
+sync-defaults:
+	python3 sync-embedded-defaults.py
 
 restart:
 	docker compose restart
