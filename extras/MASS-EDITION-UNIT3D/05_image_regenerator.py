@@ -82,6 +82,8 @@ ENV_DEFAULTS = [
     ("ME_REGEN_ALL",        "0",  "1 = procesa todo el cliente e ignora ID_START/ID_END"),
     ("ME_REGEN_LIMIT",      "0",  "Tope de torrents por tirada. 0 = sin tope"),
     ("ME_REGEN_MAX_FALLOS", "15", "Fallos seguidos tras los que se aborta la tirada"),
+    ("ME_REGEN_MAX_FALLOS_SUBIDA", "3",
+     "Subidas fallidas seguidas tras las que se aborta (las capturas ya cuestan ffmpeg)"),
 ]
 
 _CIERTO = {"1", "true", "yes", "y", "on", "si", "sí", "s", "t"}
@@ -183,35 +185,121 @@ if RAWLOADRR_DIR not in sys.path:
 # El estado va por tracker: los ids son de un tracker concreto, así que un
 # completados_regen.txt compartido hacía que al cambiar de tracker se saltaran
 # torrents distintos que casualmente tienen el mismo id.
+def _arg_valor(nombre):
+    """Lee `--nombre VALOR` o `--nombre=VALOR` de la línea de órdenes."""
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        if a == nombre and i + 1 < len(argv):
+            return argv[i + 1].strip()
+        if a.startswith(nombre + "="):
+            return a.split("=", 1)[1].strip()
+    return None
+
+
+def _tracker_pedido():
+    """`--tracker NOBS`. Sin él se usa el tracker del config/.env de siempre."""
+    v = _arg_valor("--tracker") or _arg_valor("-t")
+    return v.upper() if v else None
+
+
+# Config POR TRACKER, para poder lanzar NOBS y MILNU a la vez.
+# Convención que ya existe en el .env: TRACKER_<ABBREV>_{URL,COOKIE_NAME,
+# COOKIE_VALUE,API_KEY}. Se usa un flag y no una variable de entorno porque
+# config.py carga el .env con override=True: un `-e ME_TRACKER_URL=…` lo pisaría
+# el fichero, así que dos procesos en paralelo acabarían en el mismo tracker.
+def _config_de_tracker(abbrev):
+    def _v(sufijo, *respaldos):
+        val = os.getenv(f"TRACKER_{abbrev}_{sufijo}", "").strip()
+        for r in respaldos:
+            if val:
+                break
+            val = str(r or "").strip()
+        return val
+
+    return {
+        "abbrev":       abbrev,
+        "base_url":     _v("URL", BASE_URL).rstrip("/"),
+        "cookie_name":  _v("COOKIE_NAME", COOKIE_NAME),
+        "cookie_value": _v("COOKIE_VALUE", COOKIE_VALUE),
+        "api_key":      _v("API_KEY", TRACKER_API_KEY),
+    }
+
+
+def _sembrar_claves_de_tracker(abbrev, cfg):
+    """Deja en el .env las 4 claves de ESTE tracker, para que sean editables.
+
+    Si la cookie sale del ME_TRACKER_COOKIE compartido, dos tiradas en paralelo
+    dependen de un único valor: en cuanto se reconfigura el otro tracker, ésta se
+    queda con una cookie ajena y falla entera. Con la clave propia presente en el
+    fichero, cada tracker es autónomo.
+    """
+    faltan = [(f"TRACKER_{abbrev}_{k}", v, c) for k, v, c in (
+        ("URL",          cfg["base_url"],    f"URL del sitio de {abbrev}"),
+        ("COOKIE_NAME",  cfg["cookie_name"], f"Nombre de la cookie de sesión de {abbrev}"),
+        ("COOKIE_VALUE", "",                 f"Cookie de sesión de {abbrev} (pégala del navegador)"),
+        ("API_KEY",      cfg["api_key"],     f"API token de {abbrev} (opcional)"),
+    )]
+    previas = list(ENV_DEFAULTS)
+    ENV_DEFAULTS[:] = faltan
+    try:
+        ensure_env_keys(_ENV_PATH)
+    finally:
+        ENV_DEFAULTS[:] = previas
+
+    if not os.getenv(f"TRACKER_{abbrev}_COOKIE_VALUE", "").strip():
+        print(f"⚠️  {abbrev} está usando la cookie compartida ME_TRACKER_COOKIE. "
+              f"Para lanzar varios trackers a la vez, rellena "
+              f"TRACKER_{abbrev}_COOKIE_VALUE en el .env.")
+
+
+_PEDIDO = _tracker_pedido()
+if _PEDIDO:
+    _T = _config_de_tracker(_PEDIDO)
+    TRACKER_ABBREV  = _T["abbrev"]
+    BASE_URL        = _T["base_url"]
+    COOKIE_NAME     = _T["cookie_name"]
+    COOKIE_VALUE    = _T["cookie_value"]
+    TRACKER_API_KEY = _T["api_key"]
+    _sembrar_claves_de_tracker(_PEDIDO, _T)
+
 _SUF = (TRACKER_ABBREV or "TRACKER").strip().upper()
 MAPA_QBIT   = os.path.join(REGEN_STATE_DIR, f"mapeo_qbit_{_SUF}.json")
-MAPA_MAESTRO = os.path.join(REGEN_STATE_DIR, "mapeo_maestro.json")
+MAPA_MAESTRO = os.path.join(REGEN_STATE_DIR, f"mapeo_maestro_{_SUF}.json")
 COMPLETADOS = os.path.join(REGEN_STATE_DIR, f"completados_regen_{_SUF}.txt")
+# Los fallos no marcan nada, así que una tirada larga los deja sólo en el
+# scrollback de la terminal. Este fichero es el registro para triaje; no manda
+# sobre nada — quien decide qué queda pendiente sigue siendo COMPLETADOS.
+FALLOS = os.path.join(REGEN_STATE_DIR, f"fallos_regen_{_SUF}.txt")
 
 # Ficheros de antes de la separación por tracker.
 COMPLETADOS_LEGADO = os.path.join(REGEN_STATE_DIR, "completados_regen.txt")
 
 
 def _migrar_estado_legado():
-    """Adopta el completados_regen.txt sin sufijo, si lo hay.
+    """Avisa del marcador antiguo sin sufijo. NO lo adopta solo.
 
-    Sin esto, la primera tirada tras el cambio de nombre empezaría con el
-    marcador vacío y volvería a recorrer todo lo ya hecho.
+    Adoptarlo automáticamente fue un error caro: el fichero heredado era de NOBS
+    y al pasar a MILNU se dio por hechos 1547 torrents que nadie había tocado —
+    y encima quedaban marcados, así que ninguna tirada posterior los recuperaba.
+    Los ids no llevan tracker dentro, así que el programa NO puede saber de quién
+    son: decide quien lo sabe. Equivocarse rehaciendo es barato (una llamada a la
+    API y "ya está limpio"); equivocarse saltando es silencioso y permanente.
     """
     if os.path.exists(COMPLETADOS) or not os.path.exists(COMPLETADOS_LEGADO):
         return
-    shutil.copy(COMPLETADOS_LEGADO, COMPLETADOS)
-    n = sum(1 for l in open(COMPLETADOS, encoding="utf-8") if l.strip())
-    print(f"♻️  Adoptado el marcador antiguo como {os.path.basename(COMPLETADOS)} "
-          f"({n} ids). Si esos ids NO son de {_SUF}, borra ese fichero y relanza.")
+    n = sum(1 for l in open(COMPLETADOS_LEGADO, encoding="utf-8") if l.strip())
+    print(f"ℹ️  Hay un marcador antiguo sin tracker ({os.path.basename(COMPLETADOS_LEGADO)}, "
+          f"{n} ids) y ninguno para {_SUF}.")
+    print(f"   NO lo adopto: si esos ids fueran de otro tracker daría por hechos "
+          f"torrents de {_SUF} sin tocarlos.")
+    print(f"   Si SON de {_SUF}:  cp {COMPLETADOS_LEGADO} {COMPLETADOS}")
+    print(f"   Si no, ignóralo: esta tirada los repasará (los ya limpios se saltan solos).")
 
-# ─── Modo de ejecución: los flags de la línea de órdenes MANDAN ──────────────
-# El modo viajaba sólo en ME_REGEN_DRY_RUN, y un valor viejo en el .env podía
-# imponerse sobre la respuesta del usuario (load_dotenv(override=True) pisa el
-# entorno del proceso). Resultado real: alguien confirmó "sí, edita el tracker"
-# y la tirada entera se ejecutó en simulacro sin tocar nada. Un argumento no lo
-# puede pisar ningún fichero de configuración, así que el modo va por argumento
-# y el entorno queda sólo como respaldo para uso suelto.
+
+# Modo de ejecución: los flags de la línea de órdenes MANDAN sobre el entorno.
+# Un valor viejo en el .env llegó a imponerse sobre la respuesta del usuario y
+# dejó una tirada entera en simulacro tras confirmar que NO. Un argumento no lo
+# puede pisar ningún fichero de configuración.
 _ARGS = set(sys.argv[1:])
 
 
@@ -236,6 +324,15 @@ TODOS   = _resolver_all()
 
 # Fallos seguidos tras los que se aborta una tirada larga.
 MAX_FALLOS_SEGUIDOS = int(os.getenv("ME_REGEN_MAX_FALLOS", "15"))
+
+# Un fallo de subida es más caro que los demás: para llegar hasta él ya se han
+# generado las capturas con ffmpeg. Si los hosts están caídos o sin cuota, los
+# 15 fallos del tope general son 15 torrents transcodificados para nada, así
+# que la subida tiene su propio tope, mucho más corto.
+MAX_FALLOS_SUBIDA = int(os.getenv("ME_REGEN_MAX_FALLOS_SUBIDA", "3"))
+
+AVISO_HOSTS = ("revisa las claves de img_host_N en config.py "
+               "(cuota agotada o API key caducada)")
 
 VIDEO_EXT = (".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mpg", ".mpeg", ".wmv", ".mov")
 
@@ -282,6 +379,17 @@ def _leer_completados():
 def _marcar_completado(tid):
     with open(COMPLETADOS, "a", encoding="utf-8") as f:
         f.write(f"{tid}\n")
+
+
+def _anotar_fallo(tid, motivo):
+    """Deja constancia del fallo. Nunca revienta la tirada por no poder
+    escribirlo: es un registro de apoyo, no estado."""
+    try:
+        with open(FALLOS, "a", encoding="utf-8") as f:
+            sello = datetime.now().isoformat(timespec="seconds")
+            f.write(f"{sello}\t{tid}\t{(motivo or '').strip()}\n")
+    except OSError:
+        pass
 
 
 def _cargar_json(ruta):
@@ -364,6 +472,68 @@ def _elegir_img_host(rl_config):
 def _es_url_muerta(url):
     u = (url or "").lower()
     return any(dead in u for dead in DEAD_HOSTS)
+
+
+# Mensajes de error que significan «el fallo fue al subir», es decir, después
+# de haber gastado ffmpeg. Ver MAX_FALLOS_SUBIDA.
+_MOTIVOS_DE_SUBIDA = (
+    "hosts de imágenes han fallado",
+    "no devolvió ninguna URL",
+    "acabó en un host muerto",
+    "img_host_",
+)
+
+
+def _es_fallo_de_subida(mensaje):
+    return any(m in (mensaje or "") for m in _MOTIVOS_DE_SUBIDA)
+
+
+# Host de la cascada → clave de API que necesita en config.py. Los que no
+# aparecen aquí (imgbox, pixhost) suben en anónimo y no tienen clave.
+CLAVE_DE_HOST = {
+    "imgbb":     "imgbb_api",
+    "ptscreens": "ptscreens_api",
+    "oeimg":     "oeimg_api",
+    "lensdump":  "lensdump_api",
+    "ptpimg":    "ptpimg_api",
+}
+
+
+def _clave_es_relleno(valor):
+    """True si la clave sigue siendo el placeholder que trae el ejemplo."""
+    v = (valor or "").strip()
+    return (not v) or "API_KEY" in v or v.lower().startswith("get_this")
+
+
+def _auditar_cascada(rl_config):
+    """Repasa img_host_1..7 y avisa de los que van a fallar seguro.
+
+    No sube nada: sólo mira si la API key está puesta. Un host sin clave no es
+    un fallback, es un retardo con un error al final — y arrastra la cascada
+    hasta agotarse, que es como se llega al KeyError 'img_host_N'.
+    """
+    defaults = rl_config.get("DEFAULT", {})
+    cascada, sospechosos = [], []
+    for i in range(1, 8):
+        host = str(defaults.get(f"img_host_{i}", "") or "").strip().lower()
+        if not host:
+            continue
+        marca = ""
+        if any(host in dead or dead.startswith(host) for dead in DEAD_HOSTS):
+            marca, motivo = " ☠️", "está en la lista de hosts muertos"
+        elif _clave_es_relleno(defaults.get(CLAVE_DE_HOST.get(host, ""), "")) \
+                and host in CLAVE_DE_HOST:
+            marca, motivo = " ⚠️", f"{CLAVE_DE_HOST[host]} sigue sin rellenar"
+        cascada.append(f"{i}:{host}{marca}")
+        if marca:
+            sospechosos.append(f"      • {host} — {motivo}")
+
+    print(f"🔗 Cascada : {'  →  '.join(cascada) or '(vacía)'}")
+    if sospechosos:
+        print("   ⚠️  Estos van a fallar y sólo alargan la cascada:")
+        print("\n".join(sospechosos))
+        print("   Quítalos de config.py o pon su clave; si fallan todos, "
+              "la cascada se agota y la tirada se para.")
 
 
 # ==========================================
@@ -459,6 +629,73 @@ def elegir_fichero(content_path):
 # ==========================================
 # 📸 GENERACIÓN + SUBIDA (reutiliza prep.py tal cual, sin tocarlo)
 # ==========================================
+def _pngs(carpeta, prefijo=None):
+    """Los PNG de una carpeta de trabajo, con el directorio escapado.
+
+    La carpeta se llama como el fichero de origen, y las releases de anime
+    vienen con corchetes: '[Tonoss]Saint Seiya … [406BA8E3].mkv__NOBS'. Para
+    glob, '[Tonoss]' es una CLASE DE CARACTERES — casa con una sola letra de
+    ese conjunto — así que la ruta no resuelve y devuelve lista vacía aunque
+    los PNG estén ahí delante. Sanear el nombre del fichero no bastaba: el que
+    lleva corchetes es el directorio.
+
+    Costaba caro y en silencio: 28 torrents de NOBS dieron "ffmpeg no generó
+    ninguna captura" con las capturas ya escritas en disco, se regeneraban
+    enteras en cada pasada (el detector de reanudación también globeaba) y los
+    PNG nunca se borraban con KEEP_PNG=0.
+    """
+    patron = f"{prefijo}-*.png" if prefijo else "*.png"
+    return glob.glob(os.path.join(glob.escape(carpeta), patron))
+
+
+def _duracion_segundos(carpeta):
+    """Duración del vídeo según el MediaInfo.json que acaba de escribir
+    exportInfo(). None si no se puede leer."""
+    ruta = os.path.join(carpeta, "MediaInfo.json")
+    try:
+        with open(ruta, "r", encoding="utf-8") as f:
+            datos = json.load(f)
+        for pista in datos.get("media", {}).get("track", []):
+            if pista.get("@type") in ("General", "Video"):
+                d = pista.get("Duration")
+                if d:
+                    return float(d)
+    except Exception:
+        pass
+    return None
+
+
+def _capturas_que_caben(carpeta, pedidas):
+    """Recorta `pedidas` a las que la duración del vídeo permite de verdad.
+
+    prep.valid_ss_time() (prep.py:1682) sortea cada marca de tiempo dentro de
+    una ventana que va de length/5 a length/2 — sólo el 30% de la película — y
+    exige que disten >=10s entre sí. En un corto la ventana no da para muchas
+    marcas y el `while not valid_time:` se queda dando vueltas PARA SIEMPRE:
+    no hay tope de intentos ni salida. Visto en vivo con 'The Legend of Mor'du'
+    (411.9s → ventana de 124s): 12 capturas pedidas, 6h de CPU al 100% sin
+    avanzar del 11/12.
+
+    El 0.55 es holgura: en la simulación, a partir de ~0.7 de ocupación los
+    intentos se disparan de decenas a decenas de miles.
+    """
+    dur = _duracion_segundos(carpeta)
+    if not dur or dur <= 0:
+        return pedidas
+
+    ventana = round(dur / 2) - round(dur / 5)
+    caben = int(ventana / 10 * 0.55)
+    if caben < 1:
+        caben = 1
+    if pedidas <= caben:
+        return pedidas
+
+    print(f"    ✂️  {int(dur)}s de metraje: {pedidas} capturas no caben en la "
+          f"ventana de muestreo de prep ({ventana}s), pido {caben}", flush=True)
+    return caben
+
+
+
 def regenerar_imagenes(media_path, uuid, screens, img_host, rl_config, reanudar):
     from src.prep import Prep
 
@@ -470,7 +707,7 @@ def regenerar_imagenes(media_path, uuid, screens, img_host, rl_config, reanudar)
     # (mensaje "Reusing screenshots"). Eso es lo que queremos al reanudar, pero
     # una carpeta a medias del pasado haría que no se regenerase nada.
     if not reanudar:
-        for viejo in glob.glob(os.path.join(carpeta, "*.png")):
+        for viejo in _pngs(carpeta):
             os.remove(viejo)
 
     # Prefijo de los PNG: prep los nombra "{filename}-{i}.png" y luego los
@@ -499,18 +736,29 @@ def regenerar_imagenes(media_path, uuid, screens, img_host, rl_config, reanudar)
         # Se piden 2 de más: prep descarta capturas negras o diminutas y además
         # borra la más pequeña del lote, así que pedir justas devuelve de menos
         # (visto: 10 pedidas → 9 subidas) y la galería encogía en silencio.
-        prep.screenshots(media_path, filename, uuid, base_dir, meta, num_screens=screens + 2)
+        pedidas = _capturas_que_caben(carpeta, screens + 2)
+        prep.screenshots(media_path, filename, uuid, base_dir, meta, num_screens=pedidas)
 
-        disponibles = sorted(glob.glob(os.path.join(carpeta, f"{filename}-*.png")))
+        disponibles = sorted(_pngs(carpeta, filename))
         if not disponibles:
             return None, "ffmpeg no generó ninguna captura"
 
         # Sólo se suben las que se van a usar: subir el sobrante gastaría cuota
         # del host de imágenes para nada.
         elegidas = [os.path.basename(x) for x in disponibles[:screens]]
-        image_list, _i = prep.upload_screens(
-            meta, len(elegidas), 1, 0, len(elegidas), elegidas, {}
-        )
+        try:
+            image_list, _i = prep.upload_screens(
+                meta, len(elegidas), 1, 0, len(elegidas), elegidas, {}
+            )
+        except KeyError as e:
+            # upload_screens() recorre img_host_1, img_host_2, … y cuando un
+            # host falla salta al siguiente. Al agotarse la lista busca el
+            # img_host_N+1 que no existe y revienta con un KeyError pelado
+            # ('img_host_6'), que no dice nada. Lo traducimos.
+            if re.fullmatch(r"img_host_\d+", str(e).strip("'\"")):
+                return None, ("todos los hosts de imágenes han fallado "
+                              f"(cascada agotada en {e}) — {AVISO_HOSTS}")
+            raise
     finally:
         os.chdir(cwd)
 
@@ -798,6 +1046,43 @@ def _reconciliar_flags_de_metadatos(payload):
             payload.pop(casilla)
 
 
+# Un 422 de "esto tiene que ir vacío", en los dos idiomas en los que UNIT3D
+# puede contestar. El tracker corre en español, pero la validación cae al inglés
+# cuando no hay traducción para la regla.
+RX_DEBE_IR_VACIO = re.compile(r"must be null|debe ser (?:nulo|null)", re.IGNORECASE)
+
+
+def _vaciar_campos_prohibidos(payload, errores):
+    """Quita del payload los ids que el servidor exige que vayan vacíos.
+
+    La categoría del torrent decide qué metadatos admite: `tvdb` y `tmdb_tv_id`
+    sólo valen en categorías `tv_meta`, `tmdb_movie_id` en `movie_meta`, etc.
+    (UNIT3D_Develop/app/Http/Requests/UpdateTorrentRequest.php:118-150 —
+    `Rule::when(!$category->tv_meta, [$mustBeNull])`). Hay filas antiguas con un
+    `tvdb` real en una categoría de película: el formulario lo pinta, nosotros lo
+    reenviamos tal cual y la validación lo rechaza. No es algo que rompamos
+    nosotros — guardar a mano desde la web da el mismo 422.
+
+    Se devuelve la lista de campos vaciados, o [] si no había ninguno de este
+    tipo (entonces el 422 es otra cosa y no hay que reintentar).
+    """
+    tocados = []
+    for campo, mensajes in (errores or {}).items():
+        if isinstance(mensajes, str):
+            mensajes = [mensajes]
+        if not any(RX_DEBE_IR_VACIO.search(str(m)) for m in mensajes):
+            continue
+        if campo in payload:
+            payload[campo] = ""
+            tocados.append(campo)
+        # La casilla que lo acompaña tiene que caerse también: si viaja marcada,
+        # `required_with` vuelve a saltar por el lado contrario.
+        for casilla, campo_id in PAREJAS_EXISTS.items():
+            if campo_id == campo:
+                payload.pop(casilla, None)
+    return tocados
+
+
 def enviar(session, form, payload, site_base, edit_url):
     target = form.get("action") or edit_url
     if target.startswith("/"):
@@ -823,11 +1108,31 @@ def enviar(session, form, payload, site_base, edit_url):
 
     if res.status_code in (200, 302):
         return True, "OK"
+
     if res.status_code == 422:
         try:
-            return False, f"Error 422: {res.json().get('errors', '???')}"
+            errores = res.json().get("errors", {})
         except Exception:
-            pass
+            return False, "HTTP 422 (respuesta ilegible)"
+
+        # El servidor dice exactamente qué campo sobra; se vacía y se reintenta
+        # UNA vez. Las capturas ya están subidas, así que el reintento no gasta
+        # cuota: sólo se repite el PATCH.
+        vaciados = _vaciar_campos_prohibidos(payload, errores)
+        if vaciados:
+            res = session.post(target, data=payload, headers=headers, timeout=30)
+            if _parece_login(res):
+                return False, "sesión caducada: la respuesta es la página de login"
+            if res.status_code in (200, 302):
+                return True, f"OK (vaciado {', '.join(vaciados)}: la categoría no lo admite)"
+            try:
+                errores = res.json().get("errors", errores)
+            except Exception:
+                pass
+            return False, f"Error 422 tras vaciar {', '.join(vaciados)}: {errores}"
+
+        return False, f"Error 422: {errores}"
+
     return False, f"HTTP {res.status_code}"
 
 
@@ -876,9 +1181,12 @@ def procesar(tid, media_root, session, site_base, rl_config, screens, img_host):
     if err:
         return False, err
 
-    uuid = os.path.basename(os.path.normpath(media_root))
+    # El nombre de carpeta era basename(content_path) y 2160 coinciden entre
+    # NOBS y MILNU (mismo título, árboles distintos). Dos tiradas en paralelo se
+    # borraban los PNG y se pisaban meta.json en la misma carpeta.
+    uuid = f"{os.path.basename(os.path.normpath(media_root))}__{_SUF}"
     carpeta = os.path.join(RAWLOADRR_DIR, "tmp", uuid)
-    reanudar = os.path.isdir(carpeta) and bool(glob.glob(os.path.join(carpeta, "*.png")))
+    reanudar = os.path.isdir(carpeta) and bool(_pngs(carpeta))
 
     # Tantas capturas como imágenes muertas haya: así la sustitución es 1 a 1 y
     # el documento no cambia en nada más. Aquí manda la descripción, no el
@@ -941,7 +1249,7 @@ def procesar(tid, media_root, session, site_base, rl_config, screens, img_host):
         print(f"   ⚠️  subido y editado, pero no se pudo escribir el estado local: {e}")
 
     if not REGEN_KEEP_PNG:
-        for png in glob.glob(os.path.join(carpeta, "*.png")):
+        for png in _pngs(carpeta):
             try:
                 os.remove(png)
             except OSError:
@@ -971,6 +1279,7 @@ def main():
     print(f"🖼️  Host    : {img_host}   (capturas: las que haga falta reponer en cada torrent)")
     print(f"⚙️  Modo    : {'SIMULACRO (no se escribe nada)' if DRY_RUN else 'REAL — se editará el tracker'}")
     print(f"☠️  Muertos : {', '.join(DEAD_HOSTS)}")
+    _auditar_cascada(rl_config)
 
     update_status("UNIT3D", "Regeneración de Imágenes", "PROCESSING",
                   details="Mapeando torrents desde el cliente")
@@ -1016,13 +1325,16 @@ def main():
         return 1
     print("🔓 Sesión válida.")
 
-    ok_n = fail_n = seguidos = 0
+    ok_n = fail_n = seguidos = seguidos_subida = 0
 
     for i, tid in enumerate(pendientes, 1):
         prog = int((i / len(pendientes)) * 100)
         update_status("UNIT3D", "Regeneración de Imágenes", "PROCESSING", progress=prog,
                       details=f"ID {tid} ({i}/{len(pendientes)})")
-        print(f"[{i}/{len(pendientes)}] ID {tid} … ", end="", flush=True)
+        # Con end="" el cursor se queda en esta línea y las barras `rich` de
+        # prep.screenshots()/upload_screens() la repintan encima: se perdía de
+        # vista qué torrent se estaba editando. Línea propia y resultado debajo.
+        print(f"[{i}/{len(pendientes)}] ID {tid}", flush=True)
 
         try:
             exito, mensaje = procesar(tid, mapa[tid], session, site_base,
@@ -1032,14 +1344,15 @@ def main():
 
         if exito:
             ok_n += 1
-            seguidos = 0
-            print(f"✨ {mensaje}")
+            seguidos = seguidos_subida = 0
+            print(f"    ✨ {mensaje}", flush=True)
             if not DRY_RUN:
                 _marcar_completado(tid)
         else:
             fail_n += 1
             seguidos += 1
-            print(f"❌ {mensaje}")
+            print(f"    ❌ {mensaje}", flush=True)
+            _anotar_fallo(tid, mensaje)
 
             # Cortafuegos para tiradas largas sin vigilancia. Lo que más duele
             # es que la cookie caduque a mitad: sin esto seguiría 3000 torrents
@@ -1049,6 +1362,20 @@ def main():
                 print("   Copia una cookie nueva (menú 3 → 1) y vuelve a lanzar: "
                       "continúa por donde iba.")
                 break
+            # Un fallo de subida sale caro: las capturas ya están hechas. Si el
+            # problema son los hosts, cada torrent de más es un ffmpeg tirado a
+            # la basura, así que se corta mucho antes que con el tope general.
+            if _es_fallo_de_subida(mensaje):
+                seguidos_subida += 1
+                if seguidos_subida >= MAX_FALLOS_SUBIDA:
+                    print(f"\n🛑 {seguidos_subida} subidas fallidas seguidas: "
+                          f"{AVISO_HOSTS}.")
+                    print("   Paro aquí; las capturas ya generadas se quedan en tmp, "
+                          "así que al relanzar no hay que rehacerlas.")
+                    break
+            else:
+                seguidos_subida = 0
+
             if seguidos >= MAX_FALLOS_SEGUIDOS:
                 print(f"\n🛑 {seguidos} fallos seguidos. Paro para que le eches un ojo "
                       f"en vez de seguir a ciegas.")
@@ -1061,6 +1388,9 @@ def main():
     print(f"\n✅ Hechos: {ok_n}   ❌ Fallos: {fail_n}" + (f"   ⏸️  Sin tocar: {quedan}" if quedan else ""))
     if not DRY_RUN:
         print(f"   Reanudable: {COMPLETADOS}")
+        if fail_n:
+            print(f"   Fallos    : {FALLOS}  (relanzar con --todos los reintenta: "
+                  f"no están marcados como hechos)")
     update_status("UNIT3D", "Regeneración de Imágenes", "COMPLETED", progress=100,
                   details=f"{ok_n} ok / {fail_n} fallos")
     return 0

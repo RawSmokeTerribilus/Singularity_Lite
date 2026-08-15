@@ -21,11 +21,14 @@ config = {'AUTO': {'delay': 0, 'description_folder': None, 'dupe_similarity': 80
              # credencial que revocar) y en 2026 se cayó llevándose miles de
              # galerías por delante. Para repararlas: extras/MASS-EDITION-UNIT3D/
              # 05_image_regenerator.py.
-             'img_host_1': 'imgbb',
-             'img_host_2': 'ptscreens',
-             'img_host_3': 'oeimg',
-             'img_host_4': 'lensdump',
-             'img_host_5': 'ptpimg',
+             # Deja activados SÓLO los hosts cuya API key hayas rellenado
+             # abajo. Un host sin clave no es un fallback: falla siempre, alarga
+             # la cascada y, si se agota, prep.py corta con KeyError 'img_host_N'.
+             'img_host_1': 'ptscreens',
+             'img_host_2': 'imgbb',
+             # 'img_host_3': 'oeimg',
+             # 'img_host_4': 'lensdump',
+             # 'img_host_5': 'ptpimg',
              'img_size': '600',
              'imgbb_api': 'IMGBB_API',
              'inline_imgs': 3,

@@ -624,7 +624,7 @@ def unit3d_orchestrator():
             f"[cyan]ImgBB    [/cyan]: {cur_imgbb}    [cyan]PTScreens[/cyan]: {cur_pts}\n"
             f"[cyan]Modo edit[/cyan]: {cur_mode}\n\n"
             "[1] Configuración del módulo  [dim](tracker, APIs, paths)[/dim]\n"
-            "[2] Configurar edición y lanzar  [dim](secuencia 01-04)[/dim]\n"
+            "[2] Configurar edición y lanzar  [dim](descarga, indexa, edita y resube)[/dim]\n"
             "[3] Regenerar imágenes desde el origen  [dim](host de imágenes caído)[/dim]\n"
             "[0] Volver",
             title="[bold green]ORQUESTADOR UNIT3D[/bold green]",
