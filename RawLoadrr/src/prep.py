@@ -3137,7 +3137,7 @@ class Prep():
                     if img_host_num == 0:
                         img_host_num = 1
                     console.print("[yellow]Imgbox failed, trying next image host")
-                    image_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, [], return_dict)        
+                    image_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, custom_img_list, return_dict)        
             else:
                 with Progress(
                     TextColumn("[bold green]Uploading Screens..."),
@@ -3165,7 +3165,7 @@ class Prep():
                             except Exception:
                                 progress.console.print("[yellow]imgbb failed, trying next image host")
                                 progress.stop()
-                                newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, [], return_dict)
+                                newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, custom_img_list, return_dict)
                         elif img_host == "oeimg":
                             url = "https://onlyimage.org/api/1/upload"
                             data = {
@@ -3183,7 +3183,7 @@ class Prep():
                             except Exception:
                                 progress.console.print("[yellow]oeimg failed, trying next image host")
                                 progress.stop()
-                                newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, [], return_dict)                                
+                                newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, custom_img_list, return_dict)                                
                         elif img_host == "ptscreens":
                             url = "https://ptscreens.com/api/1/upload"
                             data = {
@@ -3201,7 +3201,7 @@ class Prep():
                             except Exception:
                                 progress.console.print("[yellow]PT Screens failed, trying next image host")
                                 progress.stop()
-                                newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, [], return_dict)        
+                                newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, custom_img_list, return_dict)        
                         elif img_host == "freeimage.host":
                             # Upstream marcó este host como "soporte eliminado" y dejó
                             # un aviso con time.sleep(15) ANTES de pasar al siguiente.
@@ -3215,13 +3215,21 @@ class Prep():
                             # subidas no son gestionables. Va al fondo de la cascada.
                             # Además recodifica: no devuelve los bytes que le mandas.
                             url = "https://freeimage.host/api/1/upload"
-                            data = {
-                                'key': self.config['DEFAULT']['freeimage_api'],
-                                'action': 'upload',
-                                'format': 'json',
-                                'source': base64.b64encode(open(image, "rb").read()).decode('utf8'),
-                            }
                             try:
+                                # La clave se lee DENTRO del try: una instalación
+                                # vieja sin 'freeimage_api' en su config pasaba de
+                                # "aviso + salto" a un KeyError seco. Así, faltar
+                                # la clave = cascada al siguiente, como cualquier
+                                # otro fallo del host.
+                                clave = self.config['DEFAULT']['freeimage_api']
+                                if not clave or str(clave).upper().endswith('_API_KEY'):
+                                    raise KeyError('freeimage_api sin rellenar')
+                                data = {
+                                    'key': clave,
+                                    'action': 'upload',
+                                    'format': 'json',
+                                    'source': base64.b64encode(open(image, "rb").read()).decode('utf8'),
+                                }
                                 response = requests.post(url, data=data, timeout=timeout)
                                 response = response.json()
                                 if response.get('status_code') != 200:
@@ -3232,7 +3240,7 @@ class Prep():
                             except Exception:
                                 progress.console.print("[yellow]freeimage.host failed, trying next image host")
                                 progress.stop()
-                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, [], return_dict)
+                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, custom_img_list, return_dict)
                         elif img_host == "pixhost":
                             url = "https://api.pixhost.to/images"
                             data = {
@@ -3253,7 +3261,7 @@ class Prep():
                             except Exception:
                                 progress.console.print("[yellow]pixhost failed, trying next image host")
                                 progress.stop()
-                                newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, [], return_dict)
+                                newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, custom_img_list, return_dict)
                         elif img_host == "ptpimg":
                             payload = {
                                 'format' : 'json',
@@ -3275,7 +3283,7 @@ class Prep():
                             except:
                                 progress.console.print("[yellow]ptpimg failed, trying next image host")
                                 progress.stop()
-                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, [], return_dict)
+                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, custom_img_list, return_dict)
                         elif img_host == "lensdump":
                             url = "https://lensdump.com/api/1/upload"
                             data = {
@@ -3295,7 +3303,7 @@ class Prep():
                             except Exception:
                                 progress.console.print("[yellow]lensdump failed, trying next image host")
                                 progress.stop()
-                                newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, [], return_dict)
+                                newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, custom_img_list, return_dict)
                         elif img_host == "ptscreens":
                             url = "https://ptscreens.com/api/1/upload"
                             data = {
@@ -3315,7 +3323,7 @@ class Prep():
                             except Exception:
                                 progress.console.print("[yellow]PT Screens failed, trying next image host")
                                 progress.stop()
-                                newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, [], return_dict)
+                                newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, custom_img_list, return_dict)
                         elif img_host == "oeimg":
                             url = "https://onlyimage.org/api/1/upload"
                             data = {
@@ -3335,16 +3343,21 @@ class Prep():
                             except Exception:
                                 progress.console.print("[yellow]Only Image failed, trying next image host")
                                 progress.stop()
-                                newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, [], return_dict)
+                                newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, custom_img_list, return_dict)
                         elif img_host == "imgchest":
                             # Crea un "post" con la imagen. El campo multipart es
                             # images[] (en plural y con corchetes): con 'image' la
                             # API devuelve la web en HTML y no un JSON.
                             url = "https://api.imgchest.com/v1/post"
-                            headers = {
-                                'Authorization': f"Bearer {self.config['DEFAULT']['imgchest_api']}",
-                            }
                             try:
+                                # Clave dentro del try por lo mismo que freeimage:
+                                # sin ella, cascada al siguiente en vez de reventar.
+                                clave = self.config['DEFAULT']['imgchest_api']
+                                if not clave or str(clave).upper().endswith('_API_KEY'):
+                                    raise KeyError('imgchest_api sin rellenar')
+                                headers = {
+                                    'Authorization': f"Bearer {clave}",
+                                }
                                 response = requests.post(
                                     url, headers=headers,
                                     files={'images[]': (os.path.basename(image), open(image, 'rb'), 'image/jpeg')},
@@ -3357,7 +3370,7 @@ class Prep():
                             except Exception:
                                 progress.console.print("[yellow]imgchest failed, trying next image host")
                                 progress.stop()
-                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, [], return_dict)
+                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, custom_img_list, return_dict)
                         elif img_host == "thumbsnap":
                             # El campo del fichero es 'media', no 'file' ni 'image'.
                             url = "https://thumbsnap.com/api/upload"
@@ -3375,7 +3388,7 @@ class Prep():
                             except Exception:
                                 progress.console.print("[yellow]thumbsnap failed, trying next image host")
                                 progress.stop()
-                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, [], return_dict)
+                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, custom_img_list, return_dict)
                         elif img_host == "imghippo":
                             # Sólo sube: no expone borrado, y 'url' y 'view_url'
                             # son la misma URL directa (no hay visualizador).
@@ -3394,7 +3407,7 @@ class Prep():
                             except Exception:
                                 progress.console.print("[yellow]imghippo failed, trying next image host")
                                 progress.stop()
-                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, [], return_dict)
+                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, custom_img_list, return_dict)
                         elif img_host == "beeimg":
                             # La clave es OPCIONAL: sin ella la subida es anónima y
                             # funciona igual. El plan gratis topa en 1 MB por imagen,
@@ -3425,7 +3438,7 @@ class Prep():
                             except Exception:
                                 progress.console.print("[yellow]beeimg failed, trying next image host")
                                 progress.stop()
-                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, [], return_dict)
+                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, custom_img_list, return_dict)
                         elif img_host == "catbox":
                             # Devuelve la URL en texto plano, no JSON. No hay página
                             # de visualizador ni miniatura: las tres urls son la misma.
@@ -3448,7 +3461,7 @@ class Prep():
                             except Exception:
                                 progress.console.print("[yellow]catbox failed, trying next image host")
                                 progress.stop()
-                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, [], return_dict)
+                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, custom_img_list, return_dict)
                         else:
                             console.print("[bold red]Please choose a supported image host in your config")
                             exit()

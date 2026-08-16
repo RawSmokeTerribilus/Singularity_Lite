@@ -14,17 +14,29 @@ config = {
 "DEFAULT": {
     "tmdb_api": "YOUR_TMDB_API_KEY",
     "imgbb_api": "YOUR_IMGBB_API_KEY",
-    "ptpimg_api": "YOUR_PTPIMG_API_KEY",
-    "lensdump_api": "YOUR_LENSDUMP_API_KEY",
     "ptscreens_api": "YOUR_PTSCREENS_API_KEY",
     "oeimg_api": "YOUR_OEIMG_API_KEY",
-    "img_host_1": "imgbox",
-    "img_host_2": "imgbb",
-    "img_host_3": "pixhos",
-    "img_host_4": "ptscreens",
-    "img_host_5": "lensdump",
-    "img_host_6": "oeimg",
-    "img_host_7": "ptpimg",
+    "imgchest_api": "YOUR_IMGCHEST_API_KEY",
+    "thumbsnap_api": "YOUR_THUMBSNAP_API_KEY",
+    "imghippo_api": "YOUR_IMGHIPPO_API_KEY",
+    "catbox_userhash": "",
+    "beeimg_api": "",
+    # Los tres primeros funcionan SIN clave: una instalación recién hecha sube
+    # desde el minuto uno. Los siguientes necesitan su clave de arriba (los
+    # placeholders *_API_KEY se saltan solos). beeimg limita a 1 MB por imagen
+    # en el plan gratis; el JPG de las capturas entra de sobra.
+    # Fuera de la lista: imgbox (cerró y se llevó las galerías por delante),
+    # lensdump (de pago), ptpimg (clave sólo por invitación) y freeimage.host
+    # (no da clave por cuenta: la única pública es compartida).
+    "img_host_1": "pixhost",
+    "img_host_2": "beeimg",
+    "img_host_3": "catbox",
+    "img_host_4": "oeimg",
+    "img_host_5": "ptscreens",
+    "img_host_6": "imgchest",
+    "img_host_7": "thumbsnap",
+    "img_host_8": "imghippo",
+    "img_host_9": "imgbb",
     "screens": "4",
     "img_size": "500",
     "optimize_images": True,

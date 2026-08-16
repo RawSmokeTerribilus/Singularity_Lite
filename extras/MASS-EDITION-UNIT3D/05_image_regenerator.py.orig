@@ -467,14 +467,7 @@ def _elegir_img_host(rl_config):
         return REGEN_IMG_HOST
 
     defaults = rl_config.get("DEFAULT", {})
-    # Se recorre hasta donde llegue la numeración: el tope fijo de range(1, 8)
-    # era de cuando la cascada tenía 4 hosts; con 10, los puestos 8-10 no
-    # podían ser elección inicial.
-    i = 0
-    while True:
-        i += 1
-        if f"img_host_{i}" not in defaults:
-            break
+    for i in range(1, 8):
         host = str(defaults.get(f"img_host_{i}", "") or "").strip().lower()
         if not host:
             continue

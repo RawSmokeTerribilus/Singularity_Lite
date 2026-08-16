@@ -21,22 +21,33 @@ config = {'AUTO': {'delay': 0, 'description_folder': None, 'dupe_similarity': 80
              # credencial que revocar) y en 2026 se cayó llevándose miles de
              # galerías por delante. Para repararlas: extras/MASS-EDITION-UNIT3D/
              # 05_image_regenerator.py.
-             # Deja activados SÓLO los hosts cuya API key hayas rellenado
-             # abajo. Un host sin clave no es un fallback: falla siempre, alarga
-             # la cascada y, si se agota, prep.py corta con KeyError 'img_host_N'.
-             'img_host_1': 'ptscreens',
-             'img_host_2': 'imgbb',
-             # 'img_host_3': 'oeimg',
-             # 'img_host_4': 'lensdump',
-             # 'img_host_5': 'ptpimg',
+             # Los tres primeros hosts funcionan SIN clave: una instalación
+             # recién hecha sube desde el minuto uno. Los demás necesitan su
+             # API key rellenada abajo (los placeholders se saltan solos).
+             # beeimg limita a 1 MB por imagen en gratis; las capturas van en
+             # JPG y entran de sobra. Fuera de la lista: lensdump (de pago),
+             # ptpimg (clave por invitación) y freeimage.host (su única clave
+             # pública es compartida con todo el que lea sus docs).
+             'img_host_1': 'pixhost',
+             'img_host_2': 'beeimg',
+             'img_host_3': 'catbox',
+             'img_host_4': 'oeimg',
+             'img_host_5': 'ptscreens',
+             'img_host_6': 'imgchest',
+             'img_host_7': 'thumbsnap',
+             'img_host_8': 'imghippo',
+             'img_host_9': 'imgbb',
              'img_size': '600',
+             'beeimg_api': '',
+             'catbox_userhash': '',
              'imgbb_api': 'IMGBB_API',
+             'imgchest_api': 'IMGCHEST_API_KEY',
+             'imghippo_api': 'IMGHIPPO_API_KEY',
              'inline_imgs': 3,
-             'lensdump_api': 'LENSDUMP_API',
              'oeimg_api': 'OEIMG_API',
              'optimize_images': True,
-             'ptpimg_api': 'PTPIMG_API',
              'ptscreens_api': 'PTSCREENS_API',
+             'thumbsnap_api': 'THUMBSNAP_API_KEY',
              'screens': '10',
              'sfx_on_prompt': True,
              'tmdb_api': 'TMDB_API',
