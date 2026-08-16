@@ -15,7 +15,7 @@ imagen que apuntan a un host muerto. El resto de la descripción (mediainfo,
 sinopsis, tráiler, banner, firma) se reenvía byte a byte tal cual estaba.
 """
 
-import sys, os, re, json, time, glob, shutil, random
+import sys, os, re, json, time, glob, shutil, random, subprocess
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
@@ -84,6 +84,10 @@ ENV_DEFAULTS = [
     ("ME_REGEN_MAX_FALLOS", "15", "Fallos seguidos tras los que se aborta la tirada"),
     ("ME_REGEN_MAX_FALLOS_SUBIDA", "3",
      "Subidas fallidas seguidas tras las que se aborta (las capturas ya cuestan ffmpeg)"),
+    ("ME_REGEN_JPG",         "1",  "1 = recodifica las capturas a JPG antes de subirlas (misma resolución)"),
+    ("ME_REGEN_JPG_Q",       "3",  "Calidad del JPG para ffmpeg -q:v (2 mejor … 31 peor). 3 ≈ 7% del peso del PNG"),
+    ("ME_REGEN_TONEMAP",     "1",  "1 = convierte HDR/PQ a SDR en las capturas. Sin esto salen lavadas y sepia"),
+    ("ME_REGEN_TONEMAP_OP",  "mobius", "Operador de tonemap de ffmpeg: mobius (recomendado), reinhard, hable, clip"),
 ]
 
 _CIERTO = {"1", "true", "yes", "y", "on", "si", "sí", "s", "t"}
@@ -168,6 +172,10 @@ REGEN_IMG_SIZE  = os.getenv("ME_REGEN_IMG_SIZE", "350").strip()
 REGEN_STATE_DIR = os.getenv("ME_REGEN_STATE_DIR", "").strip() or "."
 REGEN_LIMIT     = int(os.getenv("ME_REGEN_LIMIT", "0") or 0)
 REGEN_KEEP_PNG  = flag("ME_REGEN_KEEP_PNG", "0")
+REGEN_JPG       = flag("ME_REGEN_JPG", "1")
+REGEN_JPG_Q     = os.getenv("ME_REGEN_JPG_Q", "3").strip() or "3"
+REGEN_TONEMAP   = flag("ME_REGEN_TONEMAP", "1")
+REGEN_TONEMAP_OP = os.getenv("ME_REGEN_TONEMAP_OP", "mobius").strip() or "mobius"
 REGEN_DRY_RUN   = flag("ME_REGEN_DRY_RUN", "0")
 REGEN_ALL       = flag("ME_REGEN_ALL", "0")
 
@@ -647,6 +655,170 @@ def _pngs(carpeta, prefijo=None):
     patron = f"{prefijo}-*.png" if prefijo else "*.png"
     return glob.glob(os.path.join(glob.escape(carpeta), patron))
 
+def _capturas(carpeta, prefijo=None):
+    """PNG + JPG de la carpeta. Para limpiar hay que mirar las dos extensiones:
+    desde que se recodifica a JPG antes de subir, borrar sólo los PNG dejaba el
+    doble de basura en tmp."""
+    salida = list(_pngs(carpeta, prefijo))
+    patron = f"{prefijo}-*.jpg" if prefijo else "*.jpg"
+    salida += glob.glob(os.path.join(glob.escape(carpeta), patron))
+    return salida
+
+
+# ── HDR → SDR ───────────────────────────────────────────────────────────────
+# Las curvas que hay que convertir. PQ (smpte2084) es HDR10/HDR10+/DV; HLG es
+# arib-std-b67. Todo lo demás ya es SDR y tocarlo lo estropearía.
+TRC_HDR = {"smpte2084", "arib-std-b67"}
+
+
+def _perfil_color(origen):
+    """(curva, compatibilidad_de_capa_base_dv) del primer stream de vídeo.
+
+    Devuelve ("", None) si no se puede leer: ante la duda NO se tonemapea, que
+    es el fallo seguro (una captura SDR sin tocar es correcta; una SDR
+    tonemapeada queda destrozada).
+    """
+    # `-seekable` es una opción del protocolo HTTP y sólo acepta [-1..0] en
+    # ficheros locales: pasarla contra una ruta de disco aborta el ffprobe con
+    # "Numerical result out of range" y deja el perfil vacío, o sea sin tonemap
+    # y en silencio. Sólo se manda cuando el origen es la URL del servidor de
+    # piezas de 06.
+    red = str(origen).startswith(("http://", "https://"))
+    try:
+        pr = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             *(["-seekable", "1"] if red else []),
+             "-show_entries", "stream=color_transfer",
+             "-show_entries", "stream_side_data=dv_profile,dv_bl_signal_compatibility_id",
+             "-of", "json", origen],
+            capture_output=True, text=True, timeout=120)
+        flujo = json.loads(pr.stdout or "{}").get("streams", [{}])[0]
+        dv = [x for x in flujo.get("side_data_list", []) if "dv_profile" in x]
+        compat = dv[0].get("dv_bl_signal_compatibility_id") if dv else None
+        return (flujo.get("color_transfer") or "").lower(), compat
+    except Exception:
+        return "", None
+
+
+def necesita_tonemap(origen):
+    """Si las capturas de este fichero saldrían lavadas sin convertir.
+
+    El criterio para Dolby Vision NO es el perfil, es la capa base:
+
+        dv_bl_signal_compatibility_id = 1  -> la base es HDR10 legítimo, se
+                                              tonemapea como cualquier HDR10
+                                            = 0  -> perfil 5 (IPT-PQ-c2): la base
+                                              NO es visible sin la capa DV, y
+                                              esta cadena le saca verdes y rosas
+
+    Medido en la biblioteca: HDR10 puro, DV P8.1 y DV P10 sobre AV1 dan todos
+    compat=1. El perfil 5 es el único que hay que esquivar.
+    """
+    if not REGEN_TONEMAP:
+        return False
+    trc, compat = _perfil_color(origen)
+    if trc not in TRC_HDR:
+        return False
+    if compat == 0:
+        print("    ⏭️  Dolby Vision perfil 5 (capa base no compatible): "
+              "sin tonemap, saldría con los colores invertidos", flush=True)
+        return False
+    return True
+
+
+def _filtro_tonemap(desde_png=False):
+    """Cadena HDR→SDR de ffmpeg.
+
+    `desde_png` es para reconvertir una captura YA escrita: `prep.screenshots()`
+    la guarda con `pix_fmt="rgb24"` (prep.py:1621) y el PNG no lleva etiquetas
+    de color, así que zscale no sabe qué está mirando y aborta con "Failed to
+    inject frame into filter network". `setparams` se las pone antes.
+    """
+    # Medido sobre 'Akira Remux-2160p HDR10', mismo fotograma (Y medio / saturación
+    # media de signalstats; el original sin tonemapear da Y=56,1 SAT=8,95):
+    #
+    #     npl=100  hable      Y=46,3  SAT=14,8   <- MÁS OSCURO que el original
+    #     npl=100  mobius     Y=68,9  SAT=22,2   <- levanta y devuelve el color
+    #     npl=100  reinhard   Y=67,0  SAT=21,9
+    #     npl=500  hable      Y=24,0  SAT= 7,6   <- subir npl aplasta más
+    #     npl=1000 hable      Y=18,1  SAT= 5,7
+    #
+    # `hable` es el operador que suele citarse, pero aquí aplastaba: las cuatro
+    # capturas de un HotD 2160p salieron con Y entre 14 y 29 sobre 255, casi
+    # negras. `mobius` conserva el rango bajo, que es donde vive el detalle que
+    # se mira para juzgar un encode. `npl` se queda en 100: subirlo oscurece.
+    cadena = (f"zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+              f"tonemap=tonemap={REGEN_TONEMAP_OP}:desat=0,"
+              f"zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
+    if desde_png:
+        cadena = ("setparams=color_primaries=bt2020:color_trc=smpte2084:"
+                  "colorspace=bt2020nc," + cadena)
+    return cadena
+
+
+def a_jpg(carpeta, nombres, calidad=None, tonemap=False):
+    """Recodifica capturas PNG a JPG, misma resolución, antes de subirlas.
+
+    Los cuatro hosts de la cascada fallaban por lo MISMO — las capturas pesan
+    demasiado — con cuatro caras distintas que parecían cuatro averías:
+
+        oeimg      400 "No key provided"   el cuerpo en base64 supera el límite
+                                           de POST, PHP descarta TODOS los campos
+                                           del formulario y la clave se va con ellos
+        pixhost    413                     Payload Too Large
+        ptscreens  413 "25 MB limit"       límite explícito
+        imgbb      400 "Rate limit"        cuota, agravada por reintentar 4 hosts
+                                           en cada torrent
+
+    Medido sobre 2058 capturas reales: mediana 1,39 MiB, p90 2,64 MiB, máximo
+    11,98 MiB. La misma imagen a JPG q3 y misma resolución pasa de 1,32 MiB a
+    91 KiB (6,7%). No se recorta el ancho a propósito: en un tracker las capturas
+    son el criterio para decidir si te bajas 40 GB, así que quien pinche en la
+    miniatura tiene que seguir viendo el detalle del encode.
+
+    No sirve `optimize_images` de RawLoadrr: prep.py sólo llama a oxipng por
+    encima de 31 MB, y aun así es compresión PNG sin pérdida (10-20%), no el 93%
+    que da pasar a JPG.
+
+    Se usa ffmpeg, que ya es dependencia dura de la suite, y no PIL, que no está
+    en la imagen. Devuelve los nombres a subir; si una conversión falla se deja
+    el PNG de esa captura, que es lo que había antes.
+    """
+    if not REGEN_JPG and not tonemap:
+        return list(nombres)
+
+    q = str(calidad or REGEN_JPG_Q)
+    vf = ["-vf", _filtro_tonemap(desde_png=True)] if tonemap else []
+    if tonemap:
+        print(f"    🌈 HDR detectado: tonemap {REGEN_TONEMAP_OP} → SDR", flush=True)
+    salida, antes, despues = [], 0, 0
+    for nombre in nombres:
+        origen = os.path.join(carpeta, nombre)
+        if not nombre.lower().endswith(".png") or not os.path.exists(origen):
+            salida.append(nombre)
+            continue
+        destino = os.path.splitext(origen)[0] + ".jpg"
+        try:
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", origen,
+                            *vf, "-q:v", q, destino],
+                           capture_output=True, text=True, timeout=180)
+        except Exception:
+            pass
+        if os.path.exists(destino) and os.path.getsize(destino) > 0:
+            antes   += os.path.getsize(origen)
+            despues += os.path.getsize(destino)
+            salida.append(os.path.basename(destino))
+        else:
+            salida.append(nombre)
+
+    if antes:
+        print(f"    🗜️  capturas a JPG q{q}: {antes/1048576:.1f} MiB → "
+              f"{despues/1048576:.2f} MiB ({despues*100/antes:.0f}%)", flush=True)
+    return salida
+
+
+
+
 
 def _duracion_segundos(carpeta):
     """Duración del vídeo según el MediaInfo.json que acaba de escribir
@@ -707,7 +879,7 @@ def regenerar_imagenes(media_path, uuid, screens, img_host, rl_config, reanudar)
     # (mensaje "Reusing screenshots"). Eso es lo que queremos al reanudar, pero
     # una carpeta a medias del pasado haría que no se regenerase nada.
     if not reanudar:
-        for viejo in _pngs(carpeta):
+        for viejo in _capturas(carpeta):
             os.remove(viejo)
 
     # Prefijo de los PNG: prep los nombra "{filename}-{i}.png" y luego los
@@ -745,7 +917,11 @@ def regenerar_imagenes(media_path, uuid, screens, img_host, rl_config, reanudar)
 
         # Sólo se suben las que se van a usar: subir el sobrante gastaría cuota
         # del host de imágenes para nada.
+
         elegidas = [os.path.basename(x) for x in disponibles[:screens]]
+        # El tonemap se aplica al recodificar, no al capturar: prep.screenshots()
+        # es de upstream y no acepta filtros, así que se reconvierte después.
+        elegidas = a_jpg(carpeta, elegidas, tonemap=necesita_tonemap(media_path))
         try:
             image_list, _i = prep.upload_screens(
                 meta, len(elegidas), 1, 0, len(elegidas), elegidas, {}
@@ -785,8 +961,20 @@ def regenerar_imagenes(media_path, uuid, screens, img_host, rl_config, reanudar)
 # ==========================================
 def _tag(img, size_attr):
     """Mismo formato que COMMON.py:121, conservando el ancho que ya tenía la
-    etiqueta original ('=600', '' , …) para no alterar la maquetación."""
-    return f"[url={img['web_url']}][img{size_attr}]{img['raw_url']}[/img][/url]"
+    etiqueta original ('=600', '' , …) para no alterar la maquetación.
+
+    Las DOS urls apuntan a la imagen directa, no al visualizador del host.
+    Antes el `[url=]` llevaba `web_url`, así que pinchar una captura sacaba al
+    usuario del tracker y lo dejaba en la página de anuncios del host. Con la
+    directa en los dos sitios se conserva el "pinchar para verla grande" y el
+    enlace lleva a la imagen.
+
+    Efecto secundario a tener presente: saltarse el visualizador es saltarse la
+    publicidad que paga el alojamiento gratuito. Es, en parte, por lo que estos
+    hosts van cerrando — y cerrar es exactamente lo que originó esta campaña
+    (imgbox se llevó 3,4K galerías por delante).
+    """
+    return f"[url={img['raw_url']}][img{size_attr}]{img['raw_url']}[/img][/url]"
 
 
 def _size_attr(match=None):
@@ -1249,7 +1437,7 @@ def procesar(tid, media_root, session, site_base, rl_config, screens, img_host):
         print(f"   ⚠️  subido y editado, pero no se pudo escribir el estado local: {e}")
 
     if not REGEN_KEEP_PNG:
-        for png in _pngs(carpeta):
+        for png in _capturas(carpeta):
             try:
                 os.remove(png)
             except OSError:

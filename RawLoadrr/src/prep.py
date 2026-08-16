@@ -359,6 +359,11 @@ class Prep():
                     pass
 
             # Take Screenshots
+            # Las subidas de RawLoadrr tonemapean el HDR por defecto (la puerta
+            # real está en screenshots(): sólo actúa si la fuente es PQ/HLG con
+            # capa base compatible). Se respeta un False explícito del llamante.
+            # BDMV queda fuera a propósito: disc_screenshots() es otra ruta.
+            meta['tonemap'] = meta.get('tonemap', True)
             if meta['is_disc'] == "BDMV":
                 if not meta.get('edit', False):
                     if meta.get('vapoursynth', False):
@@ -1554,11 +1559,64 @@ class Prep():
                 os.remove(smallest_image_path)
 
 
+    def hdr_needs_tonemap(self, path):
+        """True si las capturas de este fichero saldrían lavadas sin convertir.
+
+        Criterio: transferencia PQ/HLG (smpte2084 / arib-std-b67). Para Dolby
+        Vision manda la capa base, no el perfil: dv_bl_signal_compatibility_id=1
+        es HDR10 legítimo y se tonemapea; =0 (perfil 5, IPT-PQ-c2) no tiene base
+        visible y esta cadena le sacaría los colores invertidos, así que se deja
+        tal cual. Ante cualquier duda devuelve False: el fallo seguro es no
+        tocar (una captura SDR sin convertir es correcta; una SDR convertida
+        queda destrozada). Misma lógica que Mass-Edition 05/06, medida en
+        HDR10 puro, DV P8.1 y DV P10 sobre AV1.
+        """
+        try:
+            pr = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=color_transfer",
+                 "-show_entries", "stream_side_data=dv_profile,dv_bl_signal_compatibility_id",
+                 "-of", "json", str(path)],
+                capture_output=True, text=True, timeout=120)
+            flujo = json.loads(pr.stdout or "{}").get("streams", [{}])[0]
+            if (flujo.get("color_transfer") or "").lower() not in ("smpte2084", "arib-std-b67"):
+                return False
+            dv = [x for x in flujo.get("side_data_list", []) if "dv_profile" in x]
+            if dv and dv[0].get("dv_bl_signal_compatibility_id") == 0:
+                console.print("[yellow]Dolby Vision profile 5 (no compatible base layer): skipping tonemap")
+                return False
+            return True
+        except Exception:
+            return False
+
+    def apply_hdr_tonemap(self, ff):
+        """Encadena el HDR→SDR sobre un nodo de ffmpeg-python.
+
+        Operador `mobius` y npl=100, medidos frame a frame contra `hable` (que
+        oscurece por debajo del original: Y=40→27 en acción real) y contra npl
+        altos (aplastan). Tabla completa de medidas en Mass-Edition
+        05_image_regenerator._filtro_tonemap().
+        """
+        return (ff.filter('zscale', t='linear', npl=100)
+                  .filter('format', 'gbrpf32le')
+                  .filter('zscale', p='bt709')
+                  .filter('tonemap', tonemap='mobius', desat=0)
+                  .filter('zscale', t='bt709', m='bt709', r='tv')
+                  .filter('format', 'yuv420p'))
+
     def screenshots(self, path, filename, folder_id, base_dir, meta, num_screens=None):
         if num_screens is None:
             num_screens = self.screens - len(meta.get('image_list', []))
         if num_screens == 0:
             return
+        # Puerta explícita: sólo tonemapea quien pide `meta['tonemap']` (el flujo
+        # de subida de RawLoadrr la activa en gather_prep). Mass-Edition 05 llama
+        # aquí SIN la clave porque ya convierte él mismo al recodificar a JPG:
+        # si esta función también tonemapeara, la captura pasaría dos veces por
+        # la curva y saldría lavada otra vez, por la causa contraria.
+        tonemap_hdr = bool(meta.get('tonemap', False)) and self.hdr_needs_tonemap(path)
+        if tonemap_hdr:
+            console.print("[green]HDR source: tonemapping screenshots to SDR (mobius)")
         with open(f"{base_dir}/tmp/{folder_id}/MediaInfo.json", encoding='utf-8') as f:
             mi = json.load(f)
             video_track = mi['media']['track'][1]
@@ -1615,6 +1673,8 @@ class Prep():
                                     ff = ffmpeg.input(path, ss=ss_times[-1])
                                     if w_sar != 1 or h_sar != 1:
                                         ff = ff.filter('scale', int(round(width * w_sar)), int(round(height * h_sar)))
+                                    if tonemap_hdr:
+                                        ff = self.apply_hdr_tonemap(ff)
                                     proc = (
                                         ff
                                         .output(image_path, vframes=1, pix_fmt="rgb24")
@@ -3143,11 +3203,36 @@ class Prep():
                                 progress.stop()
                                 newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, [], return_dict)        
                         elif img_host == "freeimage.host":
-                            progress.console.print("[red]Support for freeimage.host has been removed. Please remove from your config")
-                            progress.console.print("continuing in 15 seconds")
-                            time.sleep(15)
-                            progress.stop()
-                            newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, [], return_dict)
+                            # Upstream marcó este host como "soporte eliminado" y dejó
+                            # un aviso con time.sleep(15) ANTES de pasar al siguiente.
+                            # Con una cascada de 10 hosts eso es un minuto por torrent
+                            # tirado sólo en esperas. La API sigue viva y es Chevereto
+                            # normal, así que se sube de verdad.
+                            #
+                            # OJO: en el plan gratuito no hay clave por cuenta — la
+                            # única que existe es la publicada en su documentación, así
+                            # que el límite se comparte con todo el que la copie y las
+                            # subidas no son gestionables. Va al fondo de la cascada.
+                            # Además recodifica: no devuelve los bytes que le mandas.
+                            url = "https://freeimage.host/api/1/upload"
+                            data = {
+                                'key': self.config['DEFAULT']['freeimage_api'],
+                                'action': 'upload',
+                                'format': 'json',
+                                'source': base64.b64encode(open(image, "rb").read()).decode('utf8'),
+                            }
+                            try:
+                                response = requests.post(url, data=data, timeout=timeout)
+                                response = response.json()
+                                if response.get('status_code') != 200:
+                                    progress.console.print(response)
+                                raw_url = response['image']['url']
+                                img_url = response['image'].get('medium', response['image'])['url']
+                                web_url = response['image']['url_viewer']
+                            except Exception:
+                                progress.console.print("[yellow]freeimage.host failed, trying next image host")
+                                progress.stop()
+                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, [], return_dict)
                         elif img_host == "pixhost":
                             url = "https://api.pixhost.to/images"
                             data = {
@@ -3251,6 +3336,119 @@ class Prep():
                                 progress.console.print("[yellow]Only Image failed, trying next image host")
                                 progress.stop()
                                 newhost_list, i = self.upload_screens(meta, screens - i , img_host_num + 1, i, total_screens, [], return_dict)
+                        elif img_host == "imgchest":
+                            # Crea un "post" con la imagen. El campo multipart es
+                            # images[] (en plural y con corchetes): con 'image' la
+                            # API devuelve la web en HTML y no un JSON.
+                            url = "https://api.imgchest.com/v1/post"
+                            headers = {
+                                'Authorization': f"Bearer {self.config['DEFAULT']['imgchest_api']}",
+                            }
+                            try:
+                                response = requests.post(
+                                    url, headers=headers,
+                                    files={'images[]': (os.path.basename(image), open(image, 'rb'), 'image/jpeg')},
+                                    timeout=timeout)
+                                response = response.json()
+                                datos = response['data']
+                                raw_url = datos['images'][0]['link']
+                                img_url = raw_url
+                                web_url = f"https://imgchest.com/p/{datos['id']}"
+                            except Exception:
+                                progress.console.print("[yellow]imgchest failed, trying next image host")
+                                progress.stop()
+                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, [], return_dict)
+                        elif img_host == "thumbsnap":
+                            # El campo del fichero es 'media', no 'file' ni 'image'.
+                            url = "https://thumbsnap.com/api/upload"
+                            try:
+                                response = requests.post(
+                                    url, data={'key': self.config['DEFAULT']['thumbsnap_api']},
+                                    files={'media': (os.path.basename(image), open(image, 'rb'), 'image/jpeg')},
+                                    timeout=timeout)
+                                response = response.json()
+                                if not response.get('success'):
+                                    progress.console.print(response)
+                                raw_url = response['data']['media']
+                                img_url = response['data'].get('thumb', raw_url)
+                                web_url = response['data']['url']
+                            except Exception:
+                                progress.console.print("[yellow]thumbsnap failed, trying next image host")
+                                progress.stop()
+                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, [], return_dict)
+                        elif img_host == "imghippo":
+                            # Sólo sube: no expone borrado, y 'url' y 'view_url'
+                            # son la misma URL directa (no hay visualizador).
+                            url = "https://api.imghippo.com/v1/upload"
+                            try:
+                                response = requests.post(
+                                    url, data={'api_key': self.config['DEFAULT']['imghippo_api']},
+                                    files={'file': (os.path.basename(image), open(image, 'rb'), 'image/jpeg')},
+                                    timeout=timeout)
+                                response = response.json()
+                                if not response.get('success'):
+                                    progress.console.print(response)
+                                raw_url = response['data']['url']
+                                img_url = raw_url
+                                web_url = response['data'].get('view_url', raw_url)
+                            except Exception:
+                                progress.console.print("[yellow]imghippo failed, trying next image host")
+                                progress.stop()
+                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, [], return_dict)
+                        elif img_host == "beeimg":
+                            # La clave es OPCIONAL: sin ella la subida es anónima y
+                            # funciona igual. El plan gratis topa en 1 MB por imagen,
+                            # así que hay que subir JPG, no PNG.
+                            # Si Cloudflare devuelve 403, se reintenta por IPv6.
+                            datos = {}
+                            clave = self.config['DEFAULT'].get('beeimg_api', '')
+                            if clave and not clave.endswith('_API_KEY'):
+                                datos['apikey'] = clave
+                            try:
+                                response = requests.post(
+                                    "https://beeimg.com/api/upload/file/json/", data=datos,
+                                    files={'file': (os.path.basename(image), open(image, 'rb'), 'image/jpeg')},
+                                    timeout=timeout)
+                                if response.status_code == 403:
+                                    response = requests.post(
+                                        "https://ipv6.beeimg.com/api/upload/file/json/", data=datos,
+                                        files={'file': (os.path.basename(image), open(image, 'rb'), 'image/jpeg')},
+                                        timeout=timeout)
+                                response = response.json()['files']
+                                # La documentación avisa de que los códigos numéricos
+                                # pueden cambiar; el criterio es el campo 'status'.
+                                if not response.get('url'):
+                                    progress.console.print(response)
+                                raw_url = response['url']
+                                img_url = raw_url
+                                web_url = response.get('view_url', raw_url)
+                            except Exception:
+                                progress.console.print("[yellow]beeimg failed, trying next image host")
+                                progress.stop()
+                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, [], return_dict)
+                        elif img_host == "catbox":
+                            # Devuelve la URL en texto plano, no JSON. No hay página
+                            # de visualizador ni miniatura: las tres urls son la misma.
+                            # El 'userhash' es opcional y sólo sirve para poder borrar
+                            # después; sin él la subida es anónima.
+                            datos = {'reqtype': 'fileupload'}
+                            uh = self.config['DEFAULT'].get('catbox_userhash', '')
+                            if uh and not uh.endswith('_USERHASH'):
+                                datos['userhash'] = uh
+                            try:
+                                response = requests.post(
+                                    "https://catbox.moe/user/api.php", data=datos,
+                                    files={'fileToUpload': (os.path.basename(image), open(image, 'rb'))},
+                                    timeout=timeout)
+                                texto = response.text.strip()
+                                if not texto.startswith("https://"):
+                                    progress.console.print(texto[:200])
+                                    raise ValueError(texto[:200])
+                                raw_url = img_url = web_url = texto
+                            except Exception:
+                                progress.console.print("[yellow]catbox failed, trying next image host")
+                                progress.stop()
+                                newhost_list, i = self.upload_screens(meta, screens - i, img_host_num + 1, i, total_screens, [], return_dict)
                         else:
                             console.print("[bold red]Please choose a supported image host in your config")
                             exit()
