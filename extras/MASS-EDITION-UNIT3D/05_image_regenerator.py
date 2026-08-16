@@ -72,7 +72,7 @@ if filter_ids_by_range is None:
 # Viven aquí, en código que SÍ viaja en la imagen, y no en el config.py del
 # usuario: así una instalación antigua recibe el arreglo con sólo reconstruir.
 ENV_DEFAULTS = [
-    ("ME_DEAD_HOSTS",       "imgbox.com,pixhost.to", "Hosts de imágenes caídos que disparan la regeneración"),
+    ("ME_DEAD_HOSTS",       "imgbox.com", "Hosts de imágenes caídos que disparan la regeneración"),
     ("ME_REGEN_IMG_HOST",   "",   "Destino de las capturas. Vacío = primer img_host_N vivo de RawLoadrr"),
     ("ME_REGEN_SCREENS",    "",   "Nº de capturas. Vacío = tantas como haya que reponer"),
     ("ME_REGEN_KEEP_PNG",   "0",  "1 conserva los PNG en tmp; 0 los borra tras subirlos"),
@@ -164,7 +164,7 @@ if ensure_env_keys(_ENV_PATH):
         pass
 
 DEAD_HOSTS = [h.strip().lower()
-              for h in os.getenv("ME_DEAD_HOSTS", "imgbox.com,pixhost.to").split(",")
+              for h in os.getenv("ME_DEAD_HOSTS", "imgbox.com").split(",")
               if h.strip()]
 REGEN_IMG_HOST  = os.getenv("ME_REGEN_IMG_HOST", "").strip().lower()
 REGEN_SCREENS   = os.getenv("ME_REGEN_SCREENS", "").strip()
