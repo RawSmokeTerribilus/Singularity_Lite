@@ -221,7 +221,7 @@ docker exec singularity_core sh -c 'which ffmpeg ffprobe mediainfo mkvmerge'
 
 ---
 
-## Dos cosas que te van a morder
+## Tres cosas que te van a morder
 
 ### 1. El User-Agent
 
@@ -262,6 +262,41 @@ make check
 
 Y dentro del contenedor, `core/preflight.py` vuelve a comprobarlo al arrancar y te
 dice exactamente qué borrar.
+
+### 3. Si actualizas desde una versión anterior a Intruso
+
+Instalación **nueva**: nada que hacer. `make install` crea las carpetas y las
+plantillas ya traen todo.
+
+Instalación **vieja**: `docker-compose.yml` y `config/.env` son **tuyos**, así que
+una actualización del repo no los toca. Hay que añadir dos cosas a mano, o Intruso
+guardará su estado dentro del contenedor y **un `--force-recreate` se llevará la
+cola por delante**.
+
+En `docker-compose.yml`, junto al resto de volúmenes de `mass_editor`:
+
+```yaml
+      - ./work_data/mass_editor/estado:/app/estado
+```
+
+Sin `:z` — relabela el host y no hace falta.
+
+En `config/.env`:
+
+```ini
+ME_REGEN_STATE_DIR=/app/estado
+```
+
+Y crea la carpeta antes de levantar:
+
+```bash
+mkdir -p work_data/mass_editor/estado
+```
+
+Por qué importa: en esa carpeta vive la **cola del barrido**, que guarda la
+*descripción original* de cada torrent antes de limpiarlo. Es lo único que sabe
+dónde iba cada galería — y no se puede regenerar, porque un segundo barrido ya
+no encontraría los enlaces que la limpieza quitó.
 
 ---
 

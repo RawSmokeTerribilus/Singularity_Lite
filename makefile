@@ -35,6 +35,7 @@ logs:
 prep:
 	@echo "🔧 Verificando integridad de archivos de persistencia..."
 	@mkdir -p work_data/mass_editor
+	@mkdir -p work_data/mass_editor/estado
 	@mkdir -p work_data/logs/csi_log
 	@mkdir -p work_data/logs/rawloadrr
 	@mkdir -p work_data/logs/mkverything

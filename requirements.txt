@@ -43,6 +43,10 @@ cli_ui==0.19.0
 deluge-client==1.10.2
 ffmpeg-python==0.2.0
 guessit==3.8.0
+# Fase 2 de Intruso (06): descarga por ventanas de piezas para sacar capturas
+# de torrents ajenos. Hay rueda manylinux_2_17_aarch64 (cp39-cp313), así que
+# en arm64 NO se compila nada.
+libtorrent==2.1.1
 language-data<=1.2.0; python_version<='3.8'
 langcodes<=3.4.0; python_version<='3.8'
 langcodes==3.5.1; python_version>'3.8'

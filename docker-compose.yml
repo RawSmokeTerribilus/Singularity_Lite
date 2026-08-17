@@ -56,6 +56,14 @@ services:
       - ./work_data/mass_editor/mapeo_maestro.json:/app/extras/MASS-EDITION-UNIT3D/mapeo_maestro.json
       - ./work_data/mass_editor/titulos_mapa.json:/app/extras/MASS-EDITION-UNIT3D/titulos_mapa.json
       - ./work_data/mass_editor/mapeo_por_titulo.json:/app/extras/MASS-EDITION-UNIT3D/mapeo_por_titulo.json
+      # Estado de Intruso (06): la cola del barrido y los marcadores de
+      # limpiados/repuestos/aplazados. La cola guarda las DESCRIPCIONES
+      # ORIGINALES de cada torrent — si se pierden no hay forma de saber
+      # dónde iba cada galería, y un rebarrido saldría vacío porque la
+      # limpieza ya quitó los enlaces. Es lo más irremplazable del módulo.
+      # Directorio, no ficheros sueltos: 06 crea ficheros nuevos por tracker.
+      # SIN `:z` a propósito (relabela el host; ya ha mordido en producción).
+      - ./work_data/mass_editor/estado:/app/estado
       - ./work_data/tmp:/app/RawLoadrr/tmp
       - ./work_data/logs:/app/logs
       - ./work_data/reports:/app/MKVerything/docs

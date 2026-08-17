@@ -451,6 +451,20 @@ def _me_configure_tracker(me_cfg: dict) -> dict:
             if api_key:     _write_env_key("ME_TRACKER_API_KEY",      api_key)
             if cookie:      _write_env_key("ME_TRACKER_COOKIE",       cookie)
             if cookie_name: _write_env_key("ME_TRACKER_COOKIE_NAME",  cookie_name)
+            # Los módulos 05/06 lanzados con --tracker <ABBREV> NO leen
+            # ME_TRACKER_COOKIE: usan TRACKER_<ABBREV>_COOKIE_VALUE. Si sólo se
+            # actualiza la compartida, la per-tracker se queda caducada y el
+            # proceso muere con "la cookie de sesión no vale" enseñando en el
+            # panel la cookie buena. Pasó dos veces seguidas. Se escriben ambas.
+            _abbrev = (name or me_cfg.get("tracker_name") or "").strip().upper()
+            if _abbrev:
+                if cookie:      _write_env_key(f"TRACKER_{_abbrev}_COOKIE_VALUE", cookie)
+                if cookie_name: _write_env_key(f"TRACKER_{_abbrev}_COOKIE_NAME",  cookie_name)
+                if url:         _write_env_key(f"TRACKER_{_abbrev}_URL",          url)
+                if api_key:     _write_env_key(f"TRACKER_{_abbrev}_API_KEY",      api_key)
+                if cookie:
+                    console.print(f"[dim]  ↳ también TRACKER_{_abbrev}_COOKIE_VALUE "
+                                  f"(la que usa --tracker {_abbrev})[/dim]")
             me_cfg = _me_load_config()
             console.print("[green]✓ Configuración del tracker actualizada[/green]")
 
@@ -605,6 +619,116 @@ def _me_regenerar_imagenes() -> None:
         console.print(f"[bold red]El regenerador terminó con código {rc}.[/bold red]")
 
 
+def _me_intruso() -> None:
+    """Recupera galerías en torrents que NO siembras (subidas de otros usuarios).
+
+    05 sólo alcanza lo que está en tu cliente: mapea por el comentario del
+    .torrent. El barrido de NOBS dejó ~1200 páginas rotas de otros usuarios y
+    ~171 subidas tuyas que ya no siembras, fuera de su alcance.
+
+    Herramienta de ADMIN: edita páginas que no son tuyas.
+    """
+    modulo = BASE_DIR / "extras" / "MASS-EDITION-UNIT3D" / "06_intruso.py"
+    if not modulo.exists():
+        console.print("[red]Falta extras/MASS-EDITION-UNIT3D/06_intruso.py[/red]")
+        Prompt.ask("[dim]Enter para volver[/dim]", default="")
+        return
+
+    console.print()
+    console.print(Panel(
+        "Barre el tracker [bold]entero[/bold] y quita los enlaces a hosts de imágenes\n"
+        "muertos de [bold]todas[/bold] las páginas, sea quien sea el que subió el torrent.\n\n"
+        "Antes de tocar nada guarda la cola con la [bold]descripción original completa[/bold]:\n"
+        "es la vuelta atrás, y es donde la fase de reparación sabrá recolocar la galería.\n\n"
+        "[dim]Trailer, firma, banner, mediainfo y sinopsis quedan intactos. Si una\n"
+        "descripción no encaja con ningún patrón conocido, NO se escribe: va a la\n"
+        "lista de revisión manual.[/dim]",
+        title="[bold red]INTRUSO — LIMPIEZA DE ENLACES MUERTOS[/bold red]",
+        border_style="red",
+    ))
+
+    # El tracker sale del .env como en 05; aquí sólo se ofrece cambiarlo, porque
+    # el estado (cola, marcador, lista manual) va con sufijo por tracker.
+    abbrev = Prompt.ask(
+        "\nTracker  [dim](abreviatura; Enter para el de por defecto)[/dim]",
+        default="",
+    ).strip().upper()
+
+    # Qué hosts se consideran muertos ES POR TRACKER: cada uno puede tener el
+    # suyo caído. Como bandera y no por .env, porque config.py hace
+    # load_dotenv(override=True) y además dos tiradas simultáneas compartirían
+    # el valor global.
+    _muertos = os.getenv("ME_DEAD_HOSTS", "imgbox.com")
+    console.print(f"\n[dim]Hosts considerados muertos: {_muertos}[/dim]")
+    nuevos_muertos = Prompt.ask(
+        "Hosts muertos a limpiar  [dim](separados por comas; Enter para mantener)[/dim]",
+        default="",
+    ).strip()
+
+    accion = Prompt.ask(
+        "\n¿Qué hacemos?"
+        "  [dim][1] barrer  ·  [2] limpiar enlaces muertos  ·  [3] reponer galerías[/dim]",
+        choices=["1", "2", "3"], default="1",
+    )
+
+    flags = []
+    if abbrev:
+        flags += ["--tracker", abbrev]
+    if nuevos_muertos:
+        flags += ["--muertos", nuevos_muertos]
+
+    if accion == "1":
+        flags.append("--barrer")
+        console.print("[dim]Sólo se construirá la cola. No se toca el tracker.[/dim]")
+    else:
+        if accion == "3":
+            flags.append("--reponer")
+            console.print()
+            console.print(Panel(
+                "Lee la cola guardada (no barre: la fase 1 ya quitó los enlaces, así que\n"
+                "ya no hay nada que buscar) y para cada torrent con seeds baja por\n"
+                "[bold]libtorrent[/bold] sólo unas ventanas del fichero, saca capturas y las\n"
+                "devuelve al sitio que ocupaba la galería. Borra los datos al terminar.\n\n"
+                "[dim]Baja sólo unas ventanas, no el fichero entero — cuánto depende del\n"
+                "tamaño de pieza: un BDREMUX de temporada se fue a 240 MiB con 4 capturas.\n"
+                "Tope de 3 GB por torrent (ME_INTRUSO_TOPE_GB). Primero los que más seeds\n"
+                "tienen; los que no tengan ninguno se saltan.[/dim]",
+                title="[bold cyan]REPONER GALERÍAS[/bold cyan]", border_style="cyan",
+            ))
+        # OJO: en reposición el "seco" NO es gratis. Genera las capturas y las
+        # SUBE (hace falta el image_list para construir la descripción); lo único
+        # que se salta es el PATCH al tracker. Decir "sin escribir" a secas hacía
+        # creer que tampoco gastaba cuota de los hosts de imágenes.
+        _aviso_seco = ("enseña el cambio sin tocar el tracker"
+                       if accion == "2" else
+                       "no toca el tracker, pero SÍ genera y sube las capturas")
+        seco = Prompt.ask(
+            f"¿Ensayo en seco primero?  [dim]({_aviso_seco})[/dim]",
+            choices=["s", "n"], default="s",
+        )
+        flags.append("--dry-run" if seco == "s" else "--real")
+
+        tope = Prompt.ask(
+            "¿Limitamos la tirada?  [dim](nº de torrents, o Enter para todos)[/dim]",
+            default="",
+        ).strip()
+        if tope.isdigit() and int(tope) > 0:
+            flags += ["--limite", tope]
+
+        if seco == "n":
+            console.print()
+            console.print("[bold red]Vas a editar páginas de OTROS usuarios en el tracker.[/bold red]")
+            console.print("[dim]Es reanudable y la cola guarda las descripciones originales.[/dim]")
+            if Prompt.ask("¿Seguimos?", choices=["s", "n"], default="n") != "s":
+                console.print("[yellow]Cancelado.[/yellow]")
+                return
+
+    rc = _run(["python3", "extras/MASS-EDITION-UNIT3D/06_intruso.py", *flags])
+    if rc != 0:
+        console.print(f"[red]Intruso terminó con código {rc}[/red]")
+    Prompt.ask("[dim]Enter para volver[/dim]", default="")
+
+
 def unit3d_orchestrator():
     me_cfg = _me_check_essential_config(_me_load_config())
 
@@ -626,12 +750,13 @@ def unit3d_orchestrator():
             "[1] Configuración del módulo  [dim](tracker, APIs, paths)[/dim]\n"
             "[2] Configurar edición y lanzar  [dim](descarga, indexa, edita y resube)[/dim]\n"
             "[3] Regenerar imágenes desde el origen  [dim](host de imágenes caído)[/dim]\n"
+            "[4] Intruso  [dim](galerías de OTROS usuarios · libtorrent)[/dim]\n"
             "[0] Volver",
             title="[bold green]ORQUESTADOR UNIT3D[/bold green]",
             border_style="green",
         ))
 
-        sel = Prompt.ask("Selección", choices=["1", "2", "3", "0"])
+        sel = Prompt.ask("Selección", choices=["1", "2", "3", "4", "0"])
 
         if sel == "0":
             break
@@ -641,6 +766,9 @@ def unit3d_orchestrator():
 
         elif sel == "3":
             _me_regenerar_imagenes()
+
+        elif sel == "4":
+            _me_intruso()
 
         elif sel == "2":
             # --- SELECCIÓN DE MODO ---

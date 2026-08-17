@@ -37,7 +37,7 @@ PY
 echo "--- 🚀 Configurando Arsenal Singularity en: $BASE_DIR ---"
 
 mkdir -p "$CONFIG_DIR"
-mkdir -p   "$WORK_DIR/mass_editor"   "$WORK_DIR/logs/MKVerything"   "$WORK_DIR/logs/RawLoadrr"   "$WORK_DIR/logs/mkverything"   "$WORK_DIR/logs/rawloadrr"   "$WORK_DIR/logs/csi_log"   "$WORK_DIR/reports"   "$WORK_DIR/tmp/qbit_backup"   "$WORK_DIR/tmp/TEMP_RESCUE"   "$WORK_DIR/trackers"   "$WORK_DIR/cookies"   "$WORK_DIR/qbit_backup"   "$WORK_DIR/tor/data"   "$WORK_DIR/tor/logs"
+mkdir -p   "$WORK_DIR/mass_editor"   "$WORK_DIR/mass_editor/estado"   "$WORK_DIR/logs/MKVerything"   "$WORK_DIR/logs/RawLoadrr"   "$WORK_DIR/logs/mkverything"   "$WORK_DIR/logs/rawloadrr"   "$WORK_DIR/logs/csi_log"   "$WORK_DIR/reports"   "$WORK_DIR/tmp/qbit_backup"   "$WORK_DIR/tmp/TEMP_RESCUE"   "$WORK_DIR/trackers"   "$WORK_DIR/cookies"   "$WORK_DIR/qbit_backup"   "$WORK_DIR/tor/data"   "$WORK_DIR/tor/logs"
 
 touch "$CONFIG_DIR/cookies.txt"
 touch "$WORK_DIR/mass_editor/ids.txt"
