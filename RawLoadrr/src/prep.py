@@ -4,6 +4,8 @@ from src.args import Args
 from src.console import console, log
 from src.id_resolver import (resolve as _resolve_ids,
                              save_override as _save_override,
+                             save_kind as _save_kind,
+                             load_kind as _load_kind,
                              report_pending as _report_pending)
 from src.discparse import DiscParse
 from src.exceptions import ManualDateException, WeirdSystem, XEMNotFound
@@ -14,6 +16,7 @@ from src.trackers.COMMON import COMMON
 from src.musicbrainz import MusicBrainzAPI
 from src.discogs import DiscogsAPI
 from src import bookinfo
+from src import container
 from src import gameinfo
 from src import library
 from src.book_resolver import (resolve_book as _resolve_book,
@@ -193,7 +196,14 @@ class Prep():
 
         else:  # Single file scenario
             file_extension = os.path.splitext(meta['path'])[1].lower()
-            if bookinfo.looks_like_audiobook(
+            if container.is_wrapper(meta['path']):
+                # Un envase va PRIMERO y no pasa por ninguna lista de
+                # extensiones: `.iso`, `.zip`, `.rar` y `.7z` no tienen clase,
+                # tienen contenido. Aquí es donde una ISO de datos dejaba de
+                # ser reconocida y se colaba, dos ramas más abajo, al `else`
+                # de vídeo.
+                meta = await self.decidir_clase(meta)
+            elif bookinfo.looks_like_audiobook(
                     meta['path'],
                     declared=str(meta.get('category') or '').upper() == 'AUDIOBOOK'):
                 meta['is_audiobook'] = True
@@ -219,6 +229,16 @@ class Prep():
                     nfo_files = [f for f in os.listdir(directory) if f.endswith('.nfo')]
                     if nfo_files:
                         meta['nfo_file'] = os.path.join(directory, nfo_files[0])
+        # "No sé qué es esto" es un ESTADO, y hasta ahora no existía: todo lo
+        # que no fuera libro, audiolibro, juego o música entraba al pipeline de
+        # vídeo por descarte, porque "vídeo" era el `else`. Ahí es donde una
+        # ISO de datos acababa pidiéndole el FrameRate a una pista inexistente.
+        #
+        # Se corta aquí, antes de guessit y antes de mediainfo, y se salta ESTE
+        # item -- no la tirada.
+        if meta.get('kind_unknown'):
+            return meta
+
         # Estos dos cortocircuitos saltan el pipeline de vídeo entero, y con él
         # la llamada a resolve_ids() de más abajo. Hay que resolver AQUÍ, y
         # antes de gen_desc(): la portada, la sinopsis y las capturas las trae
@@ -1538,6 +1558,24 @@ class Prep():
     def get_resolution(self, guess, folder_id, base_dir):
         with open(f'{base_dir}/tmp/{folder_id}/MediaInfo.json', 'r', encoding='utf-8') as f:
             mi = json.load(f)
+
+            # `track[0]` es siempre General; la pista de vídeo es la 1. Un
+            # fichero SIN vídeo trae la lista con un solo elemento, y esto
+            # reventaba con un `IndexError: list index out of range` a cuarenta
+            # líneas de traza de distancia de la causa real -- que es que lo que
+            # se está procesando no es un vídeo.
+            #
+            # Ya no debería llegar nada así, porque la clase se decide antes de
+            # entrar aquí. Esto es la red por si se cuela algo nuevo: un mensaje
+            # que nombra el fichero vale más que la traza.
+            pistas = (mi.get('media') or {}).get('track') or []
+            if len(pistas) < 2:
+                raise WeirdSystem(
+                    "MediaInfo no encuentra ninguna pista de vídeo aquí: esto no "
+                    "es un vídeo. Declara qué es con --category "
+                    "(game|book|audiobook) o pásale su id a mano."
+                )
+
             try:
                 width = mi['media']['track'][1]['Width']
                 height = mi['media']['track'][1]['Height']
@@ -2230,6 +2268,158 @@ class Prep():
     def _override_key(self, meta):
         """Stable key for the saved-decision store: the fed release folder."""
         return os.path.basename(str(meta.get('path', '')).rstrip('/\\'))
+
+    # ─── de qué clase es esto ────────────────────────────────────────────────
+    #
+    # Un envase (.iso, .zip, .rar, .7z) no declara su clase por la extensión.
+    # Antes de que existiera esto, lo que no se reconocía caía al pipeline de
+    # vídeo por descarte -- no por decisión: "vídeo" era el `else` -- y una ISO
+    # de datos moría pidiéndole el FrameRate a una pista que no existe.
+    #
+    # La cascada, en orden, y cada peldaño sólo se pisa si el anterior calla:
+    #
+    #   1. lo que ha declarado quien sube (--category, --igdb, --isbn, --asin)
+    #   2. lo que ya se contestó otra vez para esta misma release
+    #   3. lo que hay DENTRO del envase (estructura y recuento de extensiones)
+    #   4. el nombre -- que PROPONE, nunca decide
+    #   5. preguntar
+    #
+    # Y nunca, en ningún peldaño, caer a vídeo por descarte.
+
+    _KIND_A_META = {
+        'video':     'is_video',
+        'book':      'is_book',
+        'audiobook': 'is_audiobook',
+        'game':      'is_game',
+    }
+
+    def _clase_declarada(self, meta):
+        """Peldaño 1: lo dicho a mano gana siempre. -> clase o ''."""
+        categoria = str(meta.get('category') or '').upper()
+        if categoria in ('BOOK', 'EBOOK'):
+            return 'book'
+        if categoria == 'AUDIOBOOK':
+            return 'audiobook'
+        if categoria == 'GAME':
+            return 'game'
+        if categoria in ('MOVIE', 'TV'):
+            return 'video'
+
+        # Un id a mano es una declaración de intención tan buena como la
+        # categoría: nadie pasa un id de IGDB para subir una película. Esto es
+        # lo que faltaba cuando se lanzó `--igdb 959` sobre una ISO y aun así
+        # se procesó como vídeo.
+        if meta.get('igdb'):
+            return 'game'
+        if meta.get('asin'):
+            return 'audiobook'
+        if meta.get('isbn') or meta.get('isbn13'):
+            return 'book'
+        return ''
+
+    def _clase_por_nombre(self, path, dentro=None):
+        """
+        Peldaño 4: el léxico. Devuelve `(propuesta, motivo)` y **no decide**.
+
+        Adivinar por el nombre ya mintió dos veces medidas -- "Discworld 2"
+        recortado a "Discworld" puntuaba 1.00 contra otro juego, y el puente de
+        Wikipedia daba 1.00 a "Paula y los Mayas" -> "Sonic CD". Así que esto
+        sólo ordena la pregunta: pone arriba lo más probable.
+        """
+        texto = library._fold(os.path.basename(str(path)))
+        dentro_txt = library._fold(" ".join(str(n) for n in (dentro or [])[:200]))
+
+        pistas = (
+            ('book',  ('biblioteca', 'books', 'libros', 'epub', 'ebook',
+                       'calibre', 'coleccion literaria', 'novelas')),
+            ('game',  ('romset', 'no-intro', 'redump', 'goodset', 'mame',
+                       'roms', 'abandonware', 'repack', 'gog', 'scummvm')),
+            ('video', ('bluray', 'blu-ray', 'bdrip', 'dvdrip', 'webrip',
+                       'web-dl', 'x264', 'x265', 'hdtv', '1080p', '720p',
+                       '2160p')),
+        )
+
+        for clase, palabras in pistas:
+            for palabra in palabras:
+                if palabra in texto:
+                    return clase, f"el nombre trae «{palabra}»"
+                if palabra in dentro_txt:
+                    return clase, f"dentro hay nombres con «{palabra}»"
+
+        if gameinfo._PACK_HINT.search(os.path.basename(str(path))):
+            return 'game', "el nombre tiene forma de pack de ROMs"
+
+        return '', ""
+
+    def _preguntar_clase(self, path, motivo, propuesta):
+        """Peldaño 5. Devuelve la clase elegida, o '' si se salta el item."""
+        console.print()
+        console.print(f"[bold yellow]No sé qué es[/bold yellow] "
+                      f"[cyan]{os.path.basename(str(path))}[/cyan]")
+        console.print(f"  [dim]{motivo}[/dim]")
+
+        opciones = ['game', 'book', 'audiobook', 'video']
+        for i, clase in enumerate(opciones, 1):
+            marca = "  [dim]<- lo más probable[/dim]" if clase == propuesta else ""
+            console.print(f"  [bold]{i}[/bold]  {library.LABELS[clase]}{marca}")
+        console.print("  [bold]0[/bold]  [dim]saltar este item[/dim]")
+
+        por_defecto = str(opciones.index(propuesta) + 1) if propuesta in opciones else "1"
+        elegido = Prompt.ask("[bold]Opción[/bold]",
+                             choices=[str(i) for i in range(0, len(opciones) + 1)],
+                             default=por_defecto)
+
+        return "" if elegido == "0" else opciones[int(elegido) - 1]
+
+    async def decidir_clase(self, meta):
+        """
+        Deja puesto en `meta` el `is_*` que toque, o `kind_unknown` con el
+        motivo. Nunca deja el hueco para que lo rellene el `else` de vídeo.
+        """
+        path = meta.get('path', '')
+
+        clase = self._clase_declarada(meta)
+        if clase:
+            meta[self._KIND_A_META[clase]] = True
+            return meta
+
+        okey = self._override_key(meta)
+        recordada = _load_kind(okey) if okey else ''
+        if recordada in self._KIND_A_META:
+            meta[self._KIND_A_META[recordada]] = True
+            console.print(f"[dim]{os.path.basename(str(path))}: "
+                          f"{library.LABELS[recordada]} (recordado)[/dim]")
+            return meta
+
+        clase, motivo = library.classify_path(path, meta.get('only'))
+        if clase:
+            meta[self._KIND_A_META[clase]] = True
+            console.print(f"[green]{os.path.basename(str(path))}[/green]: "
+                          f"{library.LABELS[clase]} — [dim]{motivo}[/dim]")
+            return meta
+
+        dentro = container.entries(path) if container.is_container(path) else None
+        propuesta, motivo_nombre = self._clase_por_nombre(path, dentro)
+        detalle = f"{motivo}; {motivo_nombre}" if motivo_nombre else motivo
+
+        # Sin nadie a quien preguntar se salta ESTE item, no la tirada: en un
+        # lote de 78 uno indeterminado no puede tumbar los otros 77. Es el
+        # mismo trato que ya recibe una release sin id.
+        if meta.get('unattended'):
+            _report_pending({"path": str(path), "reason": f"clase indeterminada: {detalle}"})
+            meta['kind_unknown'] = detalle
+            return meta
+
+        elegida = self._preguntar_clase(path, detalle, propuesta)
+        if not elegida:
+            meta['kind_unknown'] = "saltado a petición del operador"
+            return meta
+
+        meta[self._KIND_A_META[elegida]] = True
+        if okey:
+            _save_kind(okey, elegida)
+            console.print("[dim]  Guardado — no se volverá a preguntar por esto.[/dim]")
+        return meta
 
     def _apply_resolved(self, meta, res):
         """Copy a resolved id-set onto meta."""

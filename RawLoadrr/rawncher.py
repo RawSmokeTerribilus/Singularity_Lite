@@ -544,6 +544,38 @@ class Rawncher:
         elif sub == "3":
             self._flujo_triage(tracker)
 
+    def _declarar_categoria(self) -> list:
+        """
+        Cuando ni abriendo el envase se sabe qué es, se pregunta AQUÍ.
+
+        Vale la pena preguntarlo en el lanzador y no dejárselo a upload.py: se
+        contesta antes de que arranque nada, y la respuesta viaja en el comando,
+        que es lo que el operador ve y puede repetir.
+
+        Devolver `[]` es legítimo: significa "sigue y ya me preguntará él".
+        """
+        opciones = [
+            ("1", "game",      "juego"),
+            ("2", "book",      "e-book"),
+            ("3", "audiobook", "audiolibro"),
+            ("4", "movie",     "película"),
+            ("5", "tv",        "serie"),
+        ]
+        console.print("   [dim]Puedes declararlo ahora, o dejar que lo pregunte "
+                      "la subida.[/dim]")
+        for num, _valor, etiqueta in opciones:
+            console.print(f"   [bold]{num}[/bold]  {etiqueta}")
+        console.print("   [bold]0[/bold]  [dim]no declarar nada[/dim]")
+
+        elegido = Prompt.ask("[bold]Categoría[/bold]",
+                             choices=[n for n, _v, _e in opciones] + ["0"],
+                             default="0")
+        if elegido == "0":
+            return []
+
+        valor = next(v for n, v, _e in opciones if n == elegido)
+        return ["--category", valor]
+
     def _elegir_tipos(self, ruta, hallado) -> list:
         """
         Acota QUÉ se busca en el árbol, y devuelve los flags `--only`.
@@ -730,16 +762,24 @@ class Rawncher:
         # salía como "1 de vídeo, 1 de juego".
         from src import library as _lib
 
+        declarado = []
+
         if ruta.is_file():
-            kind = _lib.classify(ruta.name)
+            # `classify_path` ABRE los envases; `classify` sólo miraba el
+            # nombre. Con el nombre a secas, un `.iso` o un `.zip` salían como
+            # "extensión no reconocida" -- que es lo que vio quien intentó subir
+            # "Command and Conquer Red Alert 3.iso" -- y el aviso amarillo no
+            # ofrecía nada: la pregunta de más abajo sólo salta con MEZCLA, y un
+            # fichero sin clasificar no es una mezcla, es cero tipos.
+            kind, motivo = _lib.classify_path(str(ruta))
             hallado = [(kind, 1)] if kind else []
-            if hallado:
+            if kind:
                 console.print(f"[bold green]✅ {_lib.LABELS[kind].capitalize()} detectado:"
-                              f"[/bold green] {ruta.name}")
+                              f"[/bold green] {ruta.name}  [dim]({motivo})[/dim]")
             else:
-                console.print(f"[bold yellow]⚠️  Extensión no reconocida "
-                              f"({ruta.suffix or 'sin extensión'}) — se intentará "
-                              f"de todas formas.[/bold yellow]")
+                console.print(f"[bold yellow]⚠️  No sé qué es[/bold yellow] {ruta.name}")
+                console.print(f"   [dim]{motivo}[/dim]")
+                declarado = self._declarar_categoria()
         else:
             encontrado = _lib.scan(str(ruta))
             hallado = _lib.counts(encontrado)
@@ -757,7 +797,7 @@ class Rawncher:
 
         flags = self._args_opcionales(debug=debug)
 
-        cmd = ["python3", "upload.py", "--tracker", tracker, "--input", str(ruta)] + only + flags
+        cmd = ["python3", "upload.py", "--tracker", tracker, "--input", str(ruta)] + only + declarado + flags
 
         # LÓGICA DE CONTINGENCIA: Si el cliente está caído, no intentes añadir el torrent.
         # El .torrent generado se quedará en su carpeta tmp/<uuid>/

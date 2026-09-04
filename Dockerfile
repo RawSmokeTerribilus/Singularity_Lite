@@ -31,6 +31,9 @@ ENV PYTHONUNBUFFERED=1
 #   mediainfo      : the CLI (verifier, CSI) AND libmediainfo for the pymediainfo
 #                    binding that RawLoadrr imports at module scope
 #   mkvtoolnix     : mkvmerge -J, the verifier's structural check
+#   libarchive-tools : bsdtar, para listar lo que hay dentro de un .7z/.cab y
+#                    saber de qué clase es el envase. Lista por cabecera, no
+#                    descomprime. Opcional: sin él se le pregunta al operador
 #   procps         : `ps`, used by core/status_manager for live cpu/rss metrics
 #   tini           : proper PID 1 — reaps zombies, forwards signals
 #   curl           : the HEALTHCHECK below
@@ -38,6 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     mediainfo \
     mkvtoolnix \
+    libarchive-tools \
     procps \
     tini \
     curl \

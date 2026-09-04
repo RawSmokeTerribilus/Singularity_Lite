@@ -30,6 +30,11 @@ pyimgbox==1.0.7
 pyotp==2.9.0
 pyoxipng==9.1.1
 pymediainfo==7.0.1
+# Sólo se usa para LISTAR lo que hay dentro de un .rar, nunca para extraer:
+# las cabeceras RAR3/RAR5 las parsea en Python puro, así que no arrastra
+# extensiones en C ni necesita el binario `unrar`, que en Debian es non-free.
+# Sin él, un .rar simplemente no se puede abrir y se le pregunta al operador.
+rarfile==4.2
 qbittorrent-api<=2023.9.53; python_version<'3.8'
 qbittorrent-api==2026.6.0; python_version>='3.8'
 requests[socks]==2.34.2

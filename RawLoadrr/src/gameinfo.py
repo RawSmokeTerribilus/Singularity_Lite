@@ -29,8 +29,15 @@ DISC_EXTS = ('.chd', '.cue', '.bin', '.gdi', '.iso', '.img', '.ccd')
 #
 # Ninguna de éstas se la quita a nadie: el barrido de vídeo sólo mira
 # mkv/mp4/avi/ts/m2ts/m4v, y el de música ficheros de audio.
-GAME_EXTS_AUTO = ARCHIVE_EXTS + (
-    '.7z', '.chd', '.gdi', '.scummvm',
+#
+# LOS ENVASES NO ESTÁN AQUÍ, Y ES DELIBERADO. `.zip` y `.7z` estuvieron en esta
+# lista, y mientras estuvieron **todo zip era un juego**: un pack de biblioteca
+# de 300.000 libros se resolvía contra IGDB sin que nadie hubiera declarado
+# nada. Un envase no tiene clase, tiene contenido; lo abre `container` y lo
+# clasifica `library.classify_container()`. Lo mismo vale para las de disco de
+# GAME_EXTS_EXPLICIT, que siguen abajo sólo para `--category game` a mano.
+GAME_EXTS_AUTO = (
+    '.chd', '.gdi', '.scummvm',
     '.nes', '.fds', '.sfc', '.smc', '.gba', '.gb', '.gbc',
     '.n64', '.z64', '.v64', '.gen', '.smd', '.32x', '.sms', '.gg',
     '.pce', '.sgx', '.a26', '.a78', '.lnx', '.ws', '.wsc', '.ngp', '.ngc',
@@ -38,7 +45,13 @@ GAME_EXTS_AUTO = ARCHIVE_EXTS + (
 )
 
 # Éstas exigen `--category game` explícito, porque colisionan:
-#   .iso/.img/.ccd  -> MKVerything ripea TODO .iso de un árbol como disco de vídeo
+#   .iso/.img/.ccd  -> son envases: dentro puede haber un DVD o un instalador.
+#                      MKVerything ripea .iso como disco de vídeo, pero es un
+#                      programa aparte que se lanza a mano con su propio
+#                      --input/--output: RawLoadrr no lo llama nunca, así que
+#                      esa colisión no ocurre en este camino. La razón real de
+#                      que sigan aquí es que ES un envase y lo decide su
+#                      contenido, no que alguien se lo vaya a llevar.
 #   .cue/.bin       -> son también el sidecar de un rip de CD de audio
 #   .rom/.dsk/.st/.tap/.z80/.tzx/.col/.int/.vec -> chocan con ficheros de datos
 #                      corrientes; medido, un juego DOS traía 50 ".col" que eran

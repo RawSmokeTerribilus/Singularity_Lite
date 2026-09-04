@@ -198,6 +198,8 @@ def build_recursive_queue(root_path, only=None):
     # en gameinfo.
     from src import gameinfo as _gi
     from src import bookinfo as _bi
+    from src import container as _container
+    from src import library as _lib
 
     quiere_audio = bool(only) and 'audiobook' in only
 
@@ -331,7 +333,13 @@ def build_recursive_queue(root_path, only=None):
         #
         # Como los e-books, un archivo es una obra: una carpeta con 77 zips de
         # ScummVM son 77 juegos distintos, no uno en partes.
-        game_files = ([f for f in filenames if f.lower().endswith(game_extensions)]
+        # Los envases se excluyen aquí aunque `--category game` los meta en
+        # GAME_EXTS (`.iso`, `.cue`...): tienen su propia rama justo debajo. Sin
+        # este filtro, una carpeta con `juego.iso` y dos zips encolaba la ISO,
+        # hacía `continue` y se dejaba los zips fuera de la tirada -- medido.
+        game_files = ([f for f in filenames
+                       if f.lower().endswith(game_extensions)
+                       and not _container.is_wrapper(f)]
                       if _quiere('game') else [])
 
         if game_files:
@@ -339,6 +347,38 @@ def build_recursive_queue(root_path, only=None):
                 queue.append(os.path.join(dirpath, f))
 
             continue
+
+        # Los ENVASES tienen su propia rama, y tiene que existir: desde que
+        # `.zip` y `.7z` dejaron de ser extensiones de juego -- lo eran, y por
+        # eso todo zip se resolvía contra IGDB -- ya no los recoge la rama de
+        # arriba. Sin esto, una carpeta de 77 zips de ScummVM se quedaría fuera
+        # de la cola entera.
+        #
+        # Va DESPUÉS de vídeo por la misma razón que los juegos: una carpeta de
+        # pelis con un `caratulas.zip` es de vídeo.
+        #
+        # La clase se decide abriéndolo, y eso ya lo hace `library`. Aquí sólo
+        # se usa para respetar un `--only`: sin filtro entra todo, y con filtro
+        # entra lo que encaja. Un envase que no se deja clasificar entra sólo si
+        # no se ha pedido vídeo -- en un árbol de películas, un zip indescifrable
+        # es una carátula, no una obra.
+        envases = [f for f in filenames if _container.is_wrapper(f)]
+        if envases:
+            encolados = False
+            for f in envases:
+                ruta = os.path.join(dirpath, f)
+                if not only:
+                    queue.append(ruta)
+                    encolados = True
+                    continue
+
+                kind, _motivo = _lib.classify_path(ruta, only)
+                if kind in only or (kind is None and not set(only) & {'video'}):
+                    queue.append(ruta)
+                    encolados = True
+
+            if encolados:
+                continue
 
         # Un directorio hoja con los ficheros sueltos de un juego (el caso de
         # ScummVM instalado, sin comprimir) es UNA obra, así que va entero.
@@ -591,12 +631,45 @@ async def do_the_thing(base_dir):
                 
         current_file += 1
         prep = Prep(screens=meta.get('screens', 3), img_host=meta.get('imghost', 'imgbox'), config=config)
-        meta = await prep.gather_prep(meta=meta, mode='cli')
+
+        # Un item que revienta preparándose se salta; no se lleva por delante la
+        # tirada. Es el mismo trato que ya recibe una release sin id, y hasta
+        # ahora era el único sitio del bucle sin esa red: un `.iso` de datos
+        # mataba un lote de 78 juegos en el primero, con cuarenta líneas de
+        # traza y sin decir cuál era el fichero.
+        try:
+            meta = await prep.gather_prep(meta=meta, mode='cli')
+        except Exception as e:                                  # noqa: BLE001
+            skipped_files += 1
+            skipped_details.append((path, f'Error preparando: {e}'))
+            console.print(f"[bold red]Saltado[/bold red] — {path}\n  [dim]{e}[/dim]")
+            # La traza sólo con --ddebug. El logger de la casa es consola y
+            # nada más, así que un `log.exception` aquí pinta cuarenta líneas
+            # de panel por un fallo que YA está manejado y explicado arriba --
+            # que es justo el ruido del que veníamos huyendo.
+            console.print("  [dim]--ddebug para ver la traza completa.[/dim]")
+            log.debug(f"gather_prep falló en {path}", exc_info=True)
+            continue
 
         # Gather TMDb ID
         if meta.get('tmdb_not_found'):
             skipped_files += 1
             skipped_tmdb_files.append(path)
+            continue
+
+        # Sin saber de qué CLASE es, tampoco se sube. Un envase que no se ha
+        # podido abrir y cuyo nombre no dice nada no es un vídeo: es un "no lo
+        # sé", y antes ese hueco lo rellenaba el pipeline de vídeo por descarte.
+        #
+        # `--allow-no-id` NO abre esta puerta a propósito: aquello permite subir
+        # una obra sin id, no subir algo sin saber qué es.
+        if meta.get('kind_unknown'):
+            skipped_files += 1
+            skipped_details.append((path, f"Clase indeterminada: {meta['kind_unknown']}"))
+            console.print(f"[bold red]Saltado[/bold red] — {meta['kind_unknown']}. "
+                          f"[dim]Decláralo y vuelve a lanzar: --category "
+                          f"game|book|audiobook|movie, o un id a mano "
+                          f"(--igdb / --isbn / --asin).[/dim]")
             continue
 
         # Sin id determinante no se sube. La extensión no distingue un

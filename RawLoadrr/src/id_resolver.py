@@ -173,6 +173,7 @@ def save_override(key, data, path=None):
         return
     path = path or overrides_path()
     store = load_overrides(path)
+    previa = store.get(key) or {}
     store[key] = {"tmdb": _int(data.get("tmdb")),
                   "imdb": _norm_imdb(data.get("imdb")),
                   "tvdb": _int(data.get("tvdb")),
@@ -180,6 +181,13 @@ def save_override(key, data, path=None):
                   "category": data.get("category") or "TV",
                   "title": data.get("title") or "",
                   "year": data.get("year"),
+                  # La CLASE la escribe `save_kind()` y no es asunto de esta
+                  # función, pero como aquí se reconstruye la entrada entera,
+                  # sin arrastrarla se perdería: se pregunta la clase, se
+                  # guarda, y el primer id confirmado a mano la borraba. Al
+                  # relanzar volvía a preguntar lo ya contestado.
+                  "kind": data.get("kind") or previa.get("kind") or "",
+                  "kind_saved_at": previa.get("kind_saved_at"),
                   "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -187,6 +195,41 @@ def save_override(key, data, path=None):
             json.dump(store, f, indent=2, ensure_ascii=False)
     except Exception:                                           # noqa: BLE001
         pass
+
+
+def save_kind(key, kind, path=None):
+    """
+    Recuerda de qué CLASE es una release: 'game', 'book', 'video'...
+
+    Va al MISMO store que los overrides de id y bajo la misma clave, pero toca
+    únicamente el campo `kind`; lo que ya hubiera en la entrada se queda como
+    estaba. No se reutiliza `save_override()` a propósito: reescribe la entrada
+    entera con un esquema fijo, así que guardar aquí una clase borraría un tmdb
+    ya confirmado a mano y le pondría category "TV" a un juego.
+    """
+    key = _norm(key)
+    if not key or not kind:
+        return
+
+    path = path or overrides_path()
+    store = load_overrides(path)
+    entry = dict(store.get(key) or {})
+    entry["kind"] = kind
+    entry["kind_saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    store[key] = entry
+
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(store, f, indent=2, ensure_ascii=False)
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
+def load_kind(key, path=None):
+    """La clase recordada para esa release, o '' si nunca se preguntó."""
+    entry = load_overrides(path).get(_norm(key)) or {}
+    return entry.get("kind") or ""
 
 
 def clear_pending(path=None):
