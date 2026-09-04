@@ -139,9 +139,42 @@ log = _setup_logger()
 # ------------------------------------------------------------------ #
 
 def _run(cmd: list, cwd: Path = None) -> int:
+    """Lanza un subproceso heredando la terminal, y la deja como la encontró.
+
+    Un hijo que toque el terminal y muera de mala manera lo deja roto para el
+    lanzador: sin `icanon`, sin `echo` y sin `icrnl`, o sea que Enter pasa a
+    mandar CR y ningún `input()` vuelve a ver un salto de línea. El menú
+    parece colgado cuando lo único roto es la terminal, y desde esa misma
+    ventana ya no hay forma de arreglarlo porque no acepta teclas.
+
+    Pasó dos veces con el intruso: `ffmpeg` se queda en modo crudo para sus
+    atajos interactivos y el `timeout=` de subprocess lo mata con SIGKILL, así
+    que nunca restaura. Eso ya se arregló en su sitio con `-nostdin`, pero la
+    salvaguarda va aquí porque vale para CUALQUIER hijo, incluidos los que
+    todavía no existen.
+    """
     cwd_path = str(cwd or BASE_DIR)
     log.info(f"RUN: {' '.join(str(c) for c in cmd)} (cwd={cwd_path})")
-    result = subprocess.run(cmd, cwd=cwd_path)
+
+    modo_terminal = None
+
+    try:
+        import termios
+        modo_terminal = termios.tcgetattr(sys.stdin.fileno())
+    except Exception:
+        # Sin terminal (cron, tubería, dashboard): no hay nada que restaurar.
+        pass
+
+    try:
+        result = subprocess.run(cmd, cwd=cwd_path)
+    finally:
+        if modo_terminal is not None:
+            try:
+                import termios
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, modo_terminal)
+            except Exception:
+                pass
+
     log.info(f"EXIT: {result.returncode}")
     return result.returncode
 

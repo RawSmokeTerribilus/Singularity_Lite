@@ -26,6 +26,7 @@ import re
 import os
 import json
 import time
+import unicodedata
 import requests
 from difflib import SequenceMatcher
 
@@ -34,6 +35,10 @@ TIMEOUT = 12
 MIN_CANDIDATE_SCORE = 0.50   # below this a provider hit is not a valid vote
 CONSENSUS_VOTES     = 2      # providers that must agree for "high" confidence
 STRONG_LEAD         = 0.70   # min score for a hit to trigger by-id verification
+SCORE_MARGIN        = 0.15   # how far below the best score a candidate may sit
+                             # and still win on votes alone
+TMDB_LANGUAGE       = "es-ES"  # display language asked of TMDB; the catalogue
+                              # is Spanish, so an English title scores badly
 
 IMDB_PROVIDERS = ("tmdb", "omdb", "tvmaze")   # vote on the IMDB id
 MAL_PROVIDERS  = ("jikan", "anilist")         # vote on the MAL id (anime)
@@ -41,10 +46,19 @@ MAL_PROVIDERS  = ("jikan", "anilist")         # vote on the MAL id (anime)
 
 # ─── text helpers ──────────────────────────────────────────────────────────
 def _norm(s):
-    """Lowercase, drop punctuation, collapse whitespace."""
+    """Lowercase, fold diacritics, drop punctuation, collapse whitespace.
+
+    The diacritic fold has to happen before the ascii-only character class
+    below, or every accented letter becomes a word break: "limites" would
+    come out of "l\u00edmites" as "l mites", which then scores as two short
+    tokens against one. That systematically penalises the correct match in a
+    Spanish-language catalogue, which is most of what this resolver sees.
+    """
     if not s:
         return ""
-    s = re.sub(r"[^0-9a-z]+", " ", str(s).lower())
+    s = unicodedata.normalize("NFKD", str(s).lower())
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[^0-9a-z]+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
@@ -106,9 +120,18 @@ def _int(v):
         return 0
 
 
-def _cand(provider, title, year, category, tmdb=0, tvdb=0, imdb="", mal=0):
+def _cand(provider, title, year, category, tmdb=0, tvdb=0, imdb="", mal=0,
+          alt=""):
+    """One provider hit.
+
+    `alt` is a second title for the same work -- the original-language title
+    when the display title has been localised, or vice versa. Scoring takes
+    the better of the two, so a Spanish query still matches a record whose
+    display title came back in English.
+    """
     return {
         "provider": provider, "title": title or "", "year": year,
+        "alt_title": alt or "",
         "category": category, "tmdb": _int(tmdb), "tvdb": _int(tvdb),
         "imdb": _norm_imdb(imdb), "mal": _int(mal), "score": 0.0,
     }
@@ -215,23 +238,31 @@ class _TMDB:
             return []
         out = []
         try:
+            # TMDB matches the query against every alternative title it holds,
+            # but it renders the result in the requested display language and
+            # defaults to en-US. Asking for Spanish keeps `title` comparable to
+            # a Spanish query; `original_title` is carried alongside so a work
+            # whose original language is Spanish still matches when TMDB has no
+            # localised entry for it.
             if category == "MOVIE":
-                p = {"query": title}
+                p = {"query": title, "language": TMDB_LANGUAGE}
                 if year:
                     p["year"] = year
                 results = self._get("/search/movie", **p).get("results", [])
                 kind = "MOVIE"
             else:
-                p = {"query": title}
+                p = {"query": title, "language": TMDB_LANGUAGE}
                 if year:
                     p["first_air_date_year"] = year
                 results = self._get("/search/tv", **p).get("results", [])
                 kind = "TV"
             for r in results[:5]:
                 ttl = r.get("title") or r.get("name") or ""
+                alt = r.get("original_title") or r.get("original_name") or ""
                 date = r.get("release_date") or r.get("first_air_date") or ""
                 yr = _int(date[:4]) or None
-                out.append(_cand("tmdb", ttl, yr, kind, tmdb=r.get("id")))
+                out.append(_cand("tmdb", ttl, yr, kind, tmdb=r.get("id"),
+                                 alt=alt))
         except Exception as e:                                  # noqa: BLE001
             self.log(f"tmdb search failed: {e}")
         return out
@@ -373,8 +404,10 @@ def _jikan_search(title, log):
         r.raise_for_status()
         for hit in (r.json().get("data") or [])[:5]:
             ttl = hit.get("title_english") or hit.get("title") or ""
+            alt = hit.get("title") or ""
             yr = _int(hit.get("year")) or None
-            out.append(_cand("jikan", ttl, yr, "TV", mal=hit.get("mal_id")))
+            out.append(_cand("jikan", ttl, yr, "TV", mal=hit.get("mal_id"),
+                             alt=alt))
     except Exception as e:                                      # noqa: BLE001
         log(f"jikan search failed: {e}")
     return out
@@ -406,8 +439,10 @@ def _anilist_search(title, log):
         for m in media[:5]:
             t = m.get("title", {}) or {}
             ttl = t.get("english") or t.get("romaji") or ""
+            alt = t.get("romaji") or ""
             yr = _int((m.get("startDate") or {}).get("year")) or None
-            out.append(_cand("anilist", ttl, yr, "TV", mal=m.get("idMal")))
+            out.append(_cand("anilist", ttl, yr, "TV", mal=m.get("idMal"),
+                             alt=alt))
     except Exception as e:                                      # noqa: BLE001
         log(f"anilist search failed: {e}")
     return out
@@ -489,8 +524,9 @@ def resolve(title, year, category, config, aliases=None, mal_hint=False,
         return cands
 
     def _best_score(cand):
-        return max((_score(q, year, cand["title"], cand["year"])
-                    for q in queries), default=0.0)
+        titles = [t for t in (cand["title"], cand.get("alt_title")) if t]
+        return max((_score(q, year, t, cand["year"])
+                    for q in queries for t in titles), default=0.0)
 
     def _dedupe(cands):
         seen = {}
@@ -567,25 +603,49 @@ def resolve(title, year, category, config, aliases=None, mal_hint=False,
                        key=lambda k: -pool.get(k, {}).get("score", 0.0))
         for imdb in leads[:3]:
             voters = set(imdb_votes.get(imdb, set()))
+
+            # Confirmations used to be pooled with a hardcoded 0.0. Today that
+            # is inert -- every lead is already in the pool carrying the score
+            # of the search hit that made it a lead, and _pool() keeps the max
+            # -- but it stated the wrong thing: a by-id confirmation is the
+            # strongest evidence there is, not the weakest. Carrying the lead's
+            # own score says so, and stops a future caller that pools an
+            # unseen id from silently creating a zero-scored contender that
+            # the SCORE_MARGIN filter below would then have to catch.
+            lead_score = pool.get(imdb, {}).get("score", 0.0)
+
             if "omdb" not in voters:
                 rec = _omdb_by_id(omdb_key, imdb, log)
                 if rec:
                     imdb_votes.setdefault(imdb, set()).add("omdb")
-                    _pool(imdb, rec, 0.0)
+                    _pool(imdb, rec, lead_score)
             if "tmdb" not in voters:
                 rec = tmdb.verify_imdb(imdb)
                 if rec:
                     imdb_votes.setdefault(imdb, set()).add("tmdb")
-                    _pool(imdb, rec, 0.0)
+                    _pool(imdb, rec, lead_score)
             if "tvmaze" not in voters:
                 rec = _tvmaze_by_imdb(imdb, log)
                 if rec:
                     imdb_votes.setdefault(imdb, set()).add("tvmaze")
-                    _pool(imdb, rec, 0.0)
+                    _pool(imdb, rec, lead_score)
 
     imdb_n = 0
     if imdb_votes:
-        winner = max(imdb_votes,
+        # Votes used to be the primary key here, with the score only breaking
+        # ties. That let a weak-but-popular candidate beat a near-perfect one:
+        # two providers agreeing at 0.741 outranked a single provider at 1.000,
+        # and the result was still reported as "high" confidence, so it was
+        # applied without ever asking the operator.
+        #
+        # Score is now a filter: only candidates within SCORE_MARGIN of the
+        # best score may compete, and votes decide among those. Consensus
+        # still corrects a fuzzy-title mismatch between two plausible
+        # candidates, but it can no longer overrule an exact match.
+        best_score = max(pool[k]["score"] for k in imdb_votes)
+        contenders = [k for k in imdb_votes
+                      if pool[k]["score"] >= best_score - SCORE_MARGIN]
+        winner = max(contenders,
                      key=lambda k: (len(imdb_votes[k]), pool[k]["score"]))
         imdb_n = len(imdb_votes[winner])
         merged = pool[winner]

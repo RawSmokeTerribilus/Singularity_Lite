@@ -13,6 +13,24 @@ from src.trackers.HDB import HDB
 from src.trackers.COMMON import COMMON
 from src.musicbrainz import MusicBrainzAPI
 from src.discogs import DiscogsAPI
+from src import bookinfo
+from src import gameinfo
+from src import library
+from src.book_resolver import (resolve_book as _resolve_book,
+                              resolve_audiobook as _resolve_audiobook)
+from src.igdb_resolver import resolve_game as _resolve_game
+
+
+def _is_game_category(meta):
+    """
+    --category game llega en minúsculas.
+
+    meta['category'] no se normaliza a mayúsculas hasta prep.py:450, que es
+    DESPUÉS de esta detección, así que comparar con 'GAME' a secas daba
+    siempre False y el juego se colaba por el pipeline de vídeo hasta morir
+    pidiendo el FrameRate de un zip.
+    """
+    return str(meta.get('category') or '').upper() == 'GAME'
 
 try:
     import aiofiles
@@ -51,7 +69,7 @@ try:
     from imdb import Cinemagoer
     from pathlib import Path
     from pymediainfo import MediaInfo
-    from rich.prompt import Prompt
+    from rich.prompt import Prompt, Confirm
     from rich.progress import Progress, TextColumn, BarColumn, TimeRemainingColumn
     from rich.traceback import install, Traceback
     from requests.exceptions import HTTPError
@@ -89,6 +107,9 @@ class Prep():
             isdir=os.path.isdir(meta['path']),
             base_dir=os.path.abspath(os.path.dirname(os.path.dirname(__file__))),
             is_music=False,
+            is_book=False,
+            is_audiobook=False,
+            is_game=False,
             is_video=False,
             filelist={},
             user_images=[],
@@ -120,7 +141,26 @@ class Prep():
                 for file_name, full_path in all_files.items():
                     ext = os.path.splitext(file_name)[1].lower()
 
-                    if ext in ['.aac', 'ac3', '.alac', '.eac3', '.flac', '.m4a', '.mp3', '.ogg', '.ogm', '.oga', '.ogv', '.ogx', '.opus', '.spx', '.wav']:
+                    if bookinfo.looks_like_audiobook(
+                            full_path,
+                            declared=str(meta.get('category') or '').upper() == 'AUDIOBOOK'):
+                        # Va antes que la lista de audio de abajo: un .m4b es
+                        # un fichero de audio también, y gana quien pregunta
+                        # primero. Y no basta la extensión -- el primer
+                        # audiolibro real que se probó era un .m4a.
+                        meta['filelist'][file_name] = full_path
+                        meta['is_audiobook'] = True
+                    elif _is_game_category(meta) and gameinfo.is_game_file(file_name, explicit=True):
+                        # Aquí sí se exige --category game, al revés que en la
+                        # rama de fichero suelto. Un directorio es una mezcla:
+                        # una carpeta de MKVs con un `caratulas.zip` marcaría
+                        # is_game y se saltaría el pipeline de vídeo entero.
+                        meta['filelist'][file_name] = full_path
+                        meta['is_game'] = True
+                    elif ext in bookinfo.EBOOK_EXTS:
+                        meta['filelist'][file_name] = full_path
+                        meta['is_book'] = True
+                    elif ext in ['.aac', 'ac3', '.alac', '.eac3', '.flac', '.m4a', '.mp3', '.ogg', '.ogm', '.oga', '.ogv', '.ogx', '.opus', '.spx', '.wav']:
                         key = file_name
                         meta['filelist'][key] = full_path
                         meta['is_music'] = True
@@ -153,7 +193,18 @@ class Prep():
 
         else:  # Single file scenario
             file_extension = os.path.splitext(meta['path'])[1].lower()
-            if file_extension in ['.aac', '.alac', '.flac', '.m4a', '.mp3', '.opus', '.wav']:
+            if bookinfo.looks_like_audiobook(
+                    meta['path'],
+                    declared=str(meta.get('category') or '').upper() == 'AUDIOBOOK'):
+                meta['is_audiobook'] = True
+            elif gameinfo.is_game_file(meta['path'], explicit=_is_game_category(meta)):
+                # Sin flag basta con que la extensión sea inequívoca: la cola
+                # entrega los juegos de uno en uno, así que aquí siempre llega
+                # un fichero concreto y no hay nada que confundir.
+                meta['is_game'] = True
+            elif file_extension in bookinfo.EBOOK_EXTS:
+                meta['is_book'] = True
+            elif file_extension in ['.aac', '.alac', '.flac', '.m4a', '.mp3', '.opus', '.wav']:
                 meta['is_music'] = True
                 console.print('[red]Processing as music')
                 await self.process_single_music_file(meta, mode)
@@ -168,6 +219,29 @@ class Prep():
                     nfo_files = [f for f in os.listdir(directory) if f.endswith('.nfo')]
                     if nfo_files:
                         meta['nfo_file'] = os.path.join(directory, nfo_files[0])
+        # Estos dos cortocircuitos saltan el pipeline de vídeo entero, y con él
+        # la llamada a resolve_ids() de más abajo. Hay que resolver AQUÍ, y
+        # antes de gen_desc(): la portada, la sinopsis y las capturas las trae
+        # el proveedor, así que sin este paso la descripción sale pelada y el
+        # payload viaja sin isbn13, sin asin y sin igdb -- que es exactamente
+        # lo que pasó en la primera subida de prueba.
+        if meta.get('is_book') or meta.get('is_audiobook'):
+            # Same shape as the music short-circuit below: there is no disc to
+            # read, no resolution to detect and no screenshots to take, so the
+            # whole video pipeline is skipped rather than guarded step by step.
+            await self.get_book(meta)
+            meta = await self.resolve_ids(meta, os.path.basename(meta['path']))
+            meta = await self.gen_desc(meta)
+
+            return meta
+
+        if meta.get('is_game'):
+            await self.get_game(meta)
+            meta = await self.resolve_ids(meta, os.path.basename(meta['path']))
+            meta = await self.gen_desc(meta)
+
+            return meta
+
         if meta['is_music']:
             meta = await self.gen_desc(meta)
             return meta
@@ -585,6 +659,313 @@ class Prep():
                 filelist.append(videoloc)
         
         return video, filelist
+
+    async def get_book(self, meta):
+        """
+        Fill in what a book upload needs, without touching the video pipeline.
+
+        Local metadata first: an .epub carries a Dublin Core manifest and an
+        .m4b carries tags, and both are free to read. Measured over 200 real
+        e-books from the operator's library: title and author come back 100%
+        of the time, publisher 99%, year 98% -- but an ISBN only 1%. So the
+        file supplies the *query* and the tracker supplies the *id*; a local
+        ISBN, when it is there, is a gift that skips the lookup entirely.
+
+        Nothing here reaches out to the network. Identification happens later,
+        in the same resolve_ids() step the video path uses, so there is one
+        place where ids are decided rather than two.
+        """
+        meta['category'] = 'AUDIOBOOK' if meta.get('is_audiobook') else 'BOOK'
+
+        # The queue hands over a folder for an audiobook and a single file for
+        # an e-book, so pick something concrete to read tags from.
+        source = meta['path']
+
+        if os.path.isdir(source):
+            candidates = sorted(meta.get('filelist', {}).values())
+            source = candidates[0] if candidates else source
+
+        local = bookinfo.gather(source)
+        meta['_origen_local'] = local.pop('_origen', {}) or {}
+
+        # gather() answers "what work is this"; analyze() answers "what are you
+        # actually downloading" -- format, DRM, fixed vs reflowable layout,
+        # chapters, fonts, and the share of the file that is real text. It is
+        # the mediainfo of a book: an .epub at 5% text is an image dump with a
+        # nice extension, and only this number says so.
+        meta['bookinfo'] = bookinfo.analyze(source)
+        meta['book_file'] = source
+
+        # El 52% de los epubs de una biblioteca en castellano declaran su
+        # título original. Cuando el libro es una traducción, ése es el que
+        # los proveedores indexan y el español no existe.
+        original = bookinfo.original_title(source)
+        if original:
+            meta['original_title'] = original
+
+        if local.get('title') and not meta.get('title'):
+            meta['title'] = local['title']
+
+        if local.get('year') and not meta.get('year'):
+            meta['year'] = local['year']
+
+        for key in ('authors', 'narrators', 'publisher', 'language', 'runtime_min'):
+            if local.get(key) and not meta.get(key):
+                meta[key] = local[key]
+
+        # An id read off the file is a stated fact, so it short-circuits the
+        # resolver exactly like a --isbn / --asin passed on the command line.
+        if local.get('isbn') and not meta.get('isbn'):
+            meta['isbn'] = local['isbn']
+
+        if local.get('asin') and not meta.get('asin'):
+            meta['asin'] = local['asin']
+
+        # These only ever get set on the video branch, and every tracker's
+        # get_res_id() reads them unguarded.
+        # setdefault() no vale aquí: args.py mete TODAS las opciones del
+        # parser en meta, así que 'type' y 'resolution' ya existen puestas a
+        # None y la clave presente gana. Hay que mirar el valor, no la clave.
+        if not meta.get('resolution'):
+            meta['resolution'] = 'OTHER'
+
+        # The tracker types a book by its container, not by "is it a book":
+        # EPUB, PDF, MOBI, AZW3 and CBZ/CBR are separate types, and so are M4B
+        # and MP3 for audio. So the extension of the file we actually have is
+        # the type, and 'EBOOK' is only the fallback for something unmapped.
+        ext = os.path.splitext(source)[1].lower().lstrip('.')
+        by_ext = {
+            'epub': 'EPUB', 'pdf': 'PDF', 'mobi': 'MOBI', 'azw': 'MOBI',
+            'azw3': 'AZW3', 'cbz': 'CBZ/CBR', 'cbr': 'CBZ/CBR',
+            'djvu': 'PDF', 'fb2': 'EPUB',
+            # El tracker sólo tiene dos tipos de audiolibro, M4B y MP3, así
+            # que la familia AAC/MP4 va a M4B y el resto a MP3. Sin esto un
+            # .m4a caía en 'AUDIOBOOK', que no es un tipo y viajaba como 0.
+            'm4b': 'M4B', 'm4a': 'M4B', 'aax': 'M4B', 'aa': 'M4B',
+            'mp3': 'MP3', 'ogg': 'MP3', 'opus': 'MP3', 'flac': 'MP3', 'wma': 'MP3',
+        }
+        if not meta.get('type'):
+            meta['type'] = by_ext.get(
+                ext, 'AUDIOBOOK' if meta.get('is_audiobook') else 'EBOOK')
+
+        # A book has nothing to screenshot; the cover is the artwork.
+        meta['screens'] = 0
+        if not meta.get('image_list'):
+            meta['image_list'] = []
+
+
+        # Claves estructurales que sólo se rellenan en la rama de vídeo y que
+        # el resto del pipeline lee sin guardas: clients.py hace
+        # meta['is_disc'] y len(meta['filelist']) para buscar un .torrent ya
+        # hecho en qBit. Un libro no es un disco y su lista de ficheros es una
+        # LISTA de rutas, que es la convención que usa vídeo.
+        if not meta.get('is_disc'):
+            meta['is_disc'] = ''
+        if meta.get('bdinfo') is None:
+            meta['bdinfo'] = None
+        if isinstance(meta.get('filelist'), dict):
+            meta['filelist'] = sorted(meta['filelist'].values()) or [source]
+        elif not meta.get('filelist'):
+            meta['filelist'] = [source]
+
+        console.print(
+            f"[green]Book metadata: [/green]{meta.get('title', '?')} "
+            f"({meta.get('year', '?')}) "
+            f"[dim]{', '.join(meta.get('authors', [])) or 'unknown author'}[/dim]"
+        )
+
+        return meta
+
+    async def get_game(self, meta):
+        """
+        Lo que necesita la subida de un juego, sin tocar el pipeline de vídeo.
+
+        Espejo de get_book(): primero lo local y gratis -- qué sistema, cuántos
+        ficheros, con qué CRC32 -- y la identificación se deja para
+        resolve_ids(), que es donde se deciden los ids de todo lo demás.
+        """
+        meta['category'] = 'GAME'
+
+        source = meta['path']
+        meta['gameinfo'] = gameinfo.analyze(source)
+        meta['game_file'] = source
+
+        sistema = (meta['gameinfo'] or {}).get('sistema', '')
+
+        # El tipo del tracker es CÓMO se ejecuta, no en qué plataforma salió:
+        # ScummVM, ROM o PC. Un juego de ScummVM y una ROM de Mega Drive son
+        # cosas distintas de instalar aunque ambas sean "retro".
+        if not meta.get('type'):
+            if sistema == 'ScummVM':
+                meta['type'] = 'SCUMMVM'
+            elif sistema and not sistema.startswith('Disco'):
+                meta['type'] = 'ROM'
+            else:
+                meta['type'] = 'PC'
+
+        if sistema and not meta.get('platforms'):
+            meta['platforms'] = [sistema]
+
+        if not meta.get('title'):
+            meta['title'] = os.path.splitext(os.path.basename(str(source)))[0]
+
+        # Sin resolución que detectar y sin nada que capturar de un fichero que
+        # no se ejecuta: las capturas salen de IGDB, más abajo.
+        if not meta.get('resolution'):
+            meta['resolution'] = 'OTHER'
+        meta['screens'] = 0
+        if not meta.get('image_list'):
+            meta['image_list'] = []
+
+        if (meta['gameinfo'] or {}).get('es_pack'):
+            # "Sony - PS1 (A-L).zip" no es una obra y no tiene id posible.
+            # Decirlo aquí evita que el resolver se invente uno y que el
+            # operador se pregunte luego por qué la ficha salió vacía.
+            console.print("[yellow]Esto parece un pack por plataforma, no una obra: "
+                          "se sube sin id de IGDB.")
+
+
+        # Claves estructurales que sólo se rellenan en la rama de vídeo y que
+        # el resto del pipeline lee sin guardas: clients.py hace
+        # meta['is_disc'] y len(meta['filelist']) para buscar un .torrent ya
+        # hecho en qBit. Un libro no es un disco y su lista de ficheros es una
+        # LISTA de rutas, que es la convención que usa vídeo.
+        if not meta.get('is_disc'):
+            meta['is_disc'] = ''
+        if meta.get('bdinfo') is None:
+            meta['bdinfo'] = None
+        if isinstance(meta.get('filelist'), dict):
+            meta['filelist'] = sorted(meta['filelist'].values()) or [source]
+        elif not meta.get('filelist'):
+            meta['filelist'] = [source]
+
+        console.print(
+            f"[green]Game metadata: [/green]{meta.get('title', '?')} "
+            f"[dim]{sistema or 'sistema sin determinar'} · "
+            f"{len((meta['gameinfo'] or {}).get('entradas', []))} ficheros[/dim]"
+        )
+
+        return meta
+
+    async def resolve_game_ids(self, meta, filename):
+        """
+        Identificar un juego contra IGDB.
+
+        Mismo contrato que resolve_ids(): 'high' se aplica solo, y todo lo que
+        no llegue nunca se adivina en silencio -- desatendido lo apunta y
+        sigue, interactivo pregunta y recuerda la respuesta.
+        """
+        if (meta.get('gameinfo') or {}).get('es_pack') and not meta.get('igdb'):
+            return meta
+
+        raw = meta.get('title') or filename
+
+        # Antes de gastar una petición: hay nombres que no pueden ser el título
+        # de nada. Un hash de 32 hex, un número de serie, algo sin una sola
+        # letra. Es a propósito conservador -- "Contrato" PASA de aquí, porque
+        # quien tiene que decir que no es el proveedor, no una lista negra.
+        plausible, motivo = library.looks_like_work(filename or title)
+        if not plausible:
+            console.print(f"[bold red]Saltado[/bold red] — {motivo}: '{filename or title}'")
+            meta['id_not_found'] = motivo
+
+            return meta
+
+        try:
+            res = _resolve_game(raw, igdb_hint=meta.get('igdb'),
+                                config=self.config,
+                                log=lambda m: log.info(f"[igdb_resolver] {m}"))
+        except Exception as e:                                  # noqa: BLE001
+            console.print(f"[yellow]IGDB resolver error: {e} — se sube sin id.")
+            return meta
+
+        found = res.get('igdb')
+
+        if res['confidence'] == 'high' and found:
+            meta['igdb'] = found
+            self._merge_game_record(meta, res.get('record'))
+            console.print(f"[green]IGDB {found} — {res['reason']}")
+
+            return meta
+
+        if not found:
+            console.print(f"[bold red]Sin id de IGDB para '{raw}': "
+                          f"IGDB no lo reconoce como juego.")
+            console.print(f"[dim]{res.get('reason', '')}[/dim]")
+            self._report_game_pending(meta, raw, res)
+            meta['id_not_found'] = "sin id de IGDB"
+
+            return meta
+
+        if meta.get('unattended'):
+            console.print(f"[yellow]IGDB {found} sólo llega a '{res['confidence']}'. "
+                          f"En desatendido no se adivina.")
+            self._report_game_pending(meta, raw, res)
+            meta['id_not_found'] = "id de IGDB dudoso, y nadie a quien preguntar"
+
+            return meta
+
+        rec = res.get('record') or {}
+        console.print(f"[cyan]Mejor apuesta: [/cyan]{rec.get('title', raw)} "
+                      f"[dim]({rec.get('year') or 's/f'})[/dim] -> IGDB {found}")
+        console.print(f"[dim]{res.get('reason', '')}[/dim]")
+
+        if Confirm.ask("¿Uso este id?", default=False):
+            meta['igdb'] = found
+            self._merge_game_record(meta, rec)
+            _save_override(self._override_key(meta),
+                           {'igdb': found, 'title': rec.get('title', raw)})
+        else:
+            meta['id_not_found'] = "id de IGDB rechazado por quien sube"
+
+        return meta
+
+    def _merge_game_record(self, meta, record):
+        """Igual que _merge_book_record: no pisa nada que ya venga puesto."""
+        for key in ('title', 'year', 'description', 'cover_url', 'genres',
+                    'platforms', 'companies', 'trailer', 'igdb_slug'):
+            if (record or {}).get(key) and not meta.get(key):
+                meta[key] = record[key]
+
+        # La de IGDB colaba porque no lleva query string, pero sigue siendo un
+        # enlace en caliente a un tercero. Mismo trato que la de libro.
+        self._rehost_cover(meta)
+
+        # Las capturas de IGDB viajan por image_list para que las renderice el
+        # mismo bucle que las de una peli. Se REHOSTEAN, no se enlazan en
+        # caliente: enlazar al CDN de IGDB es dejar la descripción a merced de
+        # un host ajeno, que es justo la avería que ya hubo que reparar a mano
+        # en cientos de torrents cuando cayó un host de imágenes.
+        shots = (record or {}).get('screenshots') or []
+        if shots and not meta.get('image_list'):
+            local = self._download_images(meta, shots[:6])
+            if local:
+                image_list, _ = self.upload_screens(meta, len(local), 1, 0,
+                                                    len(local), local, {})
+                if image_list:
+                    meta['image_list'] = image_list
+                    meta['screens'] = len(image_list)
+
+    def _download_images(self, meta, urls):
+        """Baja unas imágenes al tmp del torrent y devuelve las rutas locales."""
+        import requests as _requests
+
+        outdir = os.path.join(meta['base_dir'], 'tmp', str(meta['uuid']))
+        os.makedirs(outdir, exist_ok=True)
+
+        paths = []
+        for n, url in enumerate(urls, 1):
+            dest = os.path.join(outdir, f"img-{n:02d}.jpg")
+            try:
+                r = _requests.get(url, timeout=20)
+                r.raise_for_status()
+                with open(dest, 'wb') as fh:
+                    fh.write(r.content)
+                paths.append(dest)
+            except Exception as e:                              # noqa: BLE001
+                log.info(f"[igdb] no se pudo bajar {url}: {e}")
+
+        return paths
 
     async def get_music(self, meta, mode):
         log.debug("Starting get_music")
@@ -1865,6 +2246,298 @@ class Prep():
             meta['tmdb_manual'] = meta['tmdb']
         return meta
 
+    async def resolve_book_ids(self, meta, filename, year=None):
+        """
+        Identify an e-book by ISBN-13 or an audiobook by ASIN.
+
+        Mirrors resolve_ids(): 'high' is applied straight away, anything
+        weaker is never guessed silently -- unattended runs log it to the
+        pending report and move on, interactive runs ask and remember the
+        answer.
+        """
+        title = meta.get('title') or filename
+        author = ', '.join(meta.get('authors') or []) or None
+        is_audio = meta['category'] == 'AUDIOBOOK'
+
+        # Antes de gastar una petición: hay nombres que no pueden ser el título
+        # de nada. Un hash de 32 hex, un número de serie, algo sin una sola
+        # letra. Es a propósito conservador -- "Contrato" PASA de aquí, porque
+        # quien tiene que decir que no es el proveedor, no una lista negra.
+        plausible, motivo = library.looks_like_work(filename or title)
+        if not plausible:
+            console.print(f"[bold red]Saltado[/bold red] — {motivo}: '{filename or title}'")
+            meta['id_not_found'] = motivo
+
+            return meta
+
+
+        try:
+            if is_audio:
+                # La duración y el narrador que traen las etiquetas son lo
+                # que distingue una grabación de otra sin preguntar.
+                local = dict(meta.get('bookinfo') or {})
+                for k in ('runtime_min', 'narrators', 'language', 'year', 'publisher'):
+                    if meta.get(k):
+                        local.setdefault(k, meta[k])
+
+                res = _resolve_audiobook(
+                    title, author,
+                    region=(self.config['DEFAULT'].get('audible_region') or 'es'),
+                    asin_hint=meta.get('asin'),
+                    log=lambda m: log.info(f"[book_resolver] {m}"),
+                    local=local)
+            else:
+                # Lo que el fichero sabe de sí mismo viaja al resolver: es lo
+                # que desempata entre ediciones sin preguntarle a nadie.
+                local = dict(meta.get('bookinfo') or {})
+                for k in ('publisher', 'language', 'year', 'page_count'):
+                    if meta.get(k):
+                        local.setdefault(k, meta[k])
+
+                if meta.get('original_title'):
+                    local['original_title'] = meta['original_title']
+
+                res = _resolve_book(
+                    title, author, year,
+                    isbn_hint=meta.get('isbn'),
+                    config=self.config,
+                    log=lambda m: log.info(f"[book_resolver] {m}"),
+                    local=local)
+        except Exception as e:                                  # noqa: BLE001
+            console.print(f"[yellow]Book resolver error: {e} — uploading without an id.")
+            return meta
+
+        found = res.get('asin') if is_audio else res.get('isbn13')
+        label = 'ASIN' if is_audio else 'ISBN-13'
+
+        if res['confidence'] == 'high' and found:
+            meta['asin' if is_audio else 'isbn'] = found
+            self._merge_book_record(meta, res.get('record'))
+            console.print(f"[green]{label} {found} — {res['reason']}")
+
+            return meta
+
+        if not found and is_audio:
+            # La grabación no está en Audible, pero eso NO dice nada del libro.
+            # Una lectura libre de *El arte de la guerra* sigue siendo *El arte
+            # de la guerra*: la portada, la sinopsis y el autor son de la OBRA,
+            # no del narrador, y no tiene menos derecho a ellos por ser libre.
+            #
+            # Así que se pregunta al segundo proveedor. Si Google Books conoce
+            # el libro, la subida se compone con los datos de la obra y sin
+            # ASIN, marcada como lectura libre. Si luego resulta ser una
+            # zarzuela, para eso están los reportes y el propio uploader.
+            if self._vestir_lectura_libre(meta, title, author, year):
+                return meta
+
+        if not found:
+            # Antes se subía igual, sin id. Así es como un `Contrato.pdf` de la
+            # carpeta de descargas acaba de torrent: la extensión no distingue
+            # un contrato de El Quijote, y quien sí sabe es el proveedor. Sin
+            # id determinante no hay obra, y sin obra no hay subida.
+            console.print(f"[bold red]Sin {label} para '{title}': "
+                          f"ningún proveedor lo reconoce como obra.")
+            console.print(f"[dim]{res.get('reason', '')}[/dim]")
+            self._report_book_pending(meta, title, label, res)
+            meta['id_not_found'] = f"sin {label}"
+
+            return meta
+
+        # A candidate exists but the edition is ambiguous, which for books is
+        # the common case: the same book has many editions and they all match
+        # the title exactly. That is a question for a human, not a coin flip.
+        if meta.get('unattended'):
+            console.print(f"[yellow]{label} {found} sólo llega a '{res['confidence']}'. "
+                          f"En desatendido no se adivina.")
+            self._report_book_pending(meta, title, label, res)
+            meta['id_not_found'] = f"{label} dudoso, y nadie a quien preguntar"
+
+            return meta
+
+        rec = res.get('record') or {}
+        console.print(f"[cyan]Best guess: [/cyan]{rec.get('title', title)} "
+                      f"[dim]{', '.join(rec.get('authors') or [])}[/dim] -> {label} {found}")
+
+        if Confirm.ask(f"¿Uso este {label}?", default=False):
+            meta['asin' if is_audio else 'isbn'] = found
+            self._merge_book_record(meta, rec)
+            _save_override(self._override_key(meta),
+                           {'asin' if is_audio else 'isbn': found, 'title': rec.get('title', title)})
+        else:
+            meta['id_not_found'] = f"{label} rechazado por quien sube"
+
+        return meta
+
+    # report_pending() recibe UN diccionario, no tres posicionales. Pasarle
+    # tres reventaba con TypeError y, peor, se llevaba la tirada ENTERA por
+    # delante: el lote de descargas murió en el cuarto item en vez de saltarlo.
+    # Estas dos dejan la entrada con la misma forma que la de vídeo, para que
+    # el informe de pendientes se pueda leer de una sola pasada.
+    def _vestir_lectura_libre(self, meta, title, author, year):
+        """
+        Grabación desconocida, obra conocida: se sube como lectura libre.
+
+        -> True si la obra queda identificada y la subida puede seguir.
+
+        Una lectura de aficionado o de un canal no existe en ningún catálogo
+        comercial, y ahí acababa bloqueada. Pero el libro sí existe, y la
+        portada, la sinopsis, el autor y los géneros son de la obra: no
+        cambian porque los lea otra voz.
+
+        Lo único que no se puede afirmar es la grabación, así que el ASIN se
+        queda vacío y se dice en la descripción. Lo que no se sabe se calla;
+        lo que se sabe se usa.
+        """
+        # El "autor" de un audiolibro suele NO ser el autor: las etiquetas
+        # traen la productora o el canal. El de la prueba decía "AMA
+        # Audiolibros", y con eso en `inauthor:` Google Books no encuentra
+        # nada. Así que se intenta con él y, si falla, sin él: el título ya
+        # suele llevar el autor dentro ("Sun Tzu - El Arte de la Guerra").
+        obra = None
+        for autor_intento in (author, None):
+            try:
+                r = _resolve_book(title, autor_intento, year, config=self.config,
+                                  log=lambda m: log.info(f"[book_resolver/obra] {m}"))
+            except Exception as e:                              # noqa: BLE001
+                log.info(f"[book_resolver/obra] {e}")
+                continue
+
+            if r.get('confidence') == 'high' and r.get('record'):
+                obra = r
+                break
+
+        if not obra:
+            return False
+
+        # Aquí SÍ se pisa el título y el autor locales, al revés que en el
+        # camino normal. Si se ha llegado hasta aquí es porque los del fichero
+        # no identificaron nada: "AMA Audiolibros" como autor y el bitrate
+        # pegado al título. Los del proveedor son mejores por definición.
+        rec = obra['record']
+        if rec.get('title'):
+            meta['title'] = rec['title']
+        if rec.get('authors'):
+            meta['authors'] = rec['authors']
+
+        self._merge_book_record(meta, rec)
+        meta['lectura_libre'] = True
+        meta['isbn13_obra'] = obra.get('isbn13') or ''
+
+        console.print(
+            f"[green]Lectura libre:[/green] la grabación no está en Audible, "
+            f"pero la obra sí — [bold]{obra['record'].get('title')}[/bold]. "
+            f"[dim]Se sube con portada y sinopsis del libro y sin ASIN.[/dim]")
+
+        return True
+
+    def _report_book_pending(self, meta, title, label, res):
+        rec = res.get('record') or {}
+        _report_pending({
+            "path": meta.get('path', ''),
+            "override_key": self._override_key(meta),
+            "filename": os.path.basename(str(meta.get('path', ''))),
+            "title": title,
+            "year": meta.get('year'),
+            "category": meta.get('category'),
+            "confidence": res.get('confidence'),
+            "reason": res.get('reason', ''),
+            "id_kind": label,
+            "best_guess": {
+                "isbn13": res.get('isbn13', ''),
+                "asin": res.get('asin', ''),
+                "title": rec.get('title', ''),
+                "authors": rec.get('authors') or [],
+                "score": res.get('score'),
+            },
+        })
+
+    def _report_game_pending(self, meta, raw, res):
+        rec = res.get('record') or {}
+        _report_pending({
+            "path": meta.get('path', ''),
+            "override_key": self._override_key(meta),
+            "filename": os.path.basename(str(meta.get('path', ''))),
+            "title": raw,
+            "year": meta.get('year'),
+            "category": "GAME",
+            "confidence": res.get('confidence'),
+            "reason": res.get('reason', ''),
+            "id_kind": "IGDB",
+            "best_guess": {
+                "igdb": res.get('igdb', 0),
+                "title": rec.get('title', ''),
+                "year": rec.get('year'),
+                "platforms": rec.get('platforms') or [],
+                "score": res.get('score'),
+            },
+        })
+
+    def _merge_book_record(self, meta, record):
+        """
+        Copia lo del proveedor sin pisar lo local... salvo lo sacado del NOMBRE.
+
+        No todo lo local vale igual. Un título que declara el EPUB en su
+        Dublin Core es un dato; uno deducido del nombre del fichero es una
+        conjetura, y encima fea: "el-arte-de-la-guerra" con el autor en
+        minúsculas producía el nombre "- el-arte-de-la-guerra (2020) [PDF]".
+
+        Así que lo del fichero sigue mandando y lo del nombre cede, que es
+        justo lo que el proveedor sabe hacer mejor.
+        """
+        origen = meta.get('_origen_local') or {}
+        del_nombre = {'title', 'authors', 'year'}
+
+        for key in ('title', 'authors', 'narrators', 'publisher', 'series',
+                    'language', 'cover_url', 'cover_fallbacks', 'description',
+                    'runtime_min', 'genres', 'page_count', 'year',
+                    'volume_id', 'isbn13', 'subtitle'):
+            valor = (record or {}).get(key)
+
+            if not valor:
+                continue
+
+            if not meta.get(key):
+                meta[key] = valor
+            elif key in del_nombre and origen.get(key) == 'nombre':
+                meta[key] = valor
+
+        self._rehost_cover(meta)
+
+    def _rehost_cover(self, meta):
+        """
+        La portada se sube a nuestro host de imágenes, no se enlaza.
+
+        Enlazarla en caliente falló por dos sitios a la vez, y merece la pena
+        anotar los dos porque el segundo no se ve venir:
+
+        1. El tracker sólo deja pasar los hosts de su lista blanca; el resto
+           los mete por un proxy de terceros.
+        2. Al hacerlo, la URL ya lleva los `&` convertidos en `&amp;`, así que
+           al proveedor le llegan parámetros llamados `amp;printsec` y
+           `amp;zoom`, y devuelve una imagen vacía.
+
+        Sólo pasaba con la portada de Google Books, porque es la única URL con
+        query string: la de IGDB no lleva parámetros y colaba. Rehosteada
+        queda un enlace limpio de un host que sí está en la lista, y de paso
+        deja de depender de que Google siga sirviendo el hotlink.
+        """
+        url = meta.get('cover_url') or ''
+
+        if not url or meta.get('cover_rehosted'):
+            return
+
+        local = self._download_images(meta, [url])
+
+        if not local:
+            return
+
+        subidas, _ = self.upload_screens(meta, 1, 1, 0, 1, local, {})
+
+        if subidas:
+            meta['cover_url'] = subidas[0]['raw_url']
+            meta['cover_rehosted'] = True
+            console.print(f"[green]Portada rehosteada:[/green] [dim]{meta['cover_url']}[/dim]")
+
     async def resolve_ids(self, meta, filename, aliases=None):
         """
         Identify the release by cross-referencing several metadata providers
@@ -1877,9 +2550,17 @@ class Prep():
         skip; interactive runs prompt, and the answer is saved so the same
         conflictive release is never asked about again.
         """
-        year = meta.get('search_year') or None
+        year = meta.get('search_year') or meta.get('year') or None
         category = (meta.get('category') or 'TV').upper()
         aliases = [a for a in (aliases or []) if a and str(a).strip()]
+
+        # Books never reach the video resolver: it votes on IMDB and MAL ids,
+        # neither of which a book has. Same verdict vocabulary comes back, so
+        # the unattended / prompt handling below is unchanged.
+        if category in ('BOOK', 'AUDIOBOOK'):
+            return await self.resolve_book_ids(meta, filename, year)
+        if category == 'GAME':
+            return await self.resolve_game_ids(meta, filename)
         mal_hint = self._looks_anime(meta, filename)
         okey = self._override_key(meta)
         try:
@@ -2992,7 +3673,13 @@ class Prep():
                         no_sample_globs.append(os.path.abspath(f"{path}{os.sep}{file}"))
                 if len(no_sample_globs) == 1:
                     path = meta['filelist'][0]
-        if meta['full_dir'] or meta['is_disc'] or meta['is_music']:
+        # La rama de abajo excluye "*.*" y sólo readmite mkv/mp4/ts/avi, así que
+        # un .epub o una ROM quedaban fuera del torrent entero y torf abortaba
+        # con "Empty or all files excluded". En un libro o un juego TODO el
+        # contenido es contenido, igual que en música.
+        if (meta['full_dir'] or meta['is_disc'] or meta['is_music']
+                or meta.get('is_book') or meta.get('is_audiobook')
+                or meta.get('is_game')):
             desc = Path(meta['uuid']).stem
             include = ""
             exclude = ['._*', 'description.txt', desc + '.txt']
@@ -3525,8 +4212,12 @@ class Prep():
         part = meta.get('part', "")
         repack = meta.get('repack', "")
         three_d = meta.get('3D', "")
-        tag = meta.get('tag', "")
-        source = meta.get('source', "")
+        # `or ""` y no un default: args.py vuelca TODAS las opciones del parser
+        # en meta, así que la clave existe puesta a None y el default de get()
+        # nunca entra. En vídeo siempre venía rellena y no se notaba; en un
+        # libro `name_notag + tag` peta con None.
+        tag = meta.get('tag') or ""
+        source = meta.get('source') or ""
         uhd = meta.get('uhd', "")
         hdr = meta.get('hdr', "")
         episode_title = meta.get('episode_title', '')
@@ -3631,6 +4322,40 @@ class Prep():
             elif type == "HDTV": #HDTV
                 name = f"{title} {year} {alt_title} {season}{episode} {episode_title} {part} {cut} {ratio} {edition} {repack} {resolution} {source} {audio} {video_encode}"
                 potential_missing = []
+        elif meta['category'] == "GAME": #GAME SPECIFIC
+            # "Título (Año) [Sistema]". El sistema va porque es lo que decide
+            # si te sirve: la misma obra en ScummVM y en ROM de Mega Drive son
+            # descargas distintas para gente distinta.
+            potential_missing = []
+            game_title = meta.get('title', '') or title
+            game_year = f"({meta.get('year')})" if meta.get('year') else ''
+            system = ', '.join(meta.get('platforms') or [])
+            system = f"[{system}]" if system else ''
+            name = f"{game_title} {game_year} {system}"
+
+        elif meta['category'] in ("BOOK", "AUDIOBOOK"): #BOOK SPECIFIC
+            # "Author - Title (Year) [FORMAT]", with the narrator appended for
+            # audiobooks because that is what makes two recordings of the same
+            # book different releases. Mirrors the MUSIC branch below rather
+            # than inventing a third convention.
+            potential_missing = []
+            book_author = ', '.join(meta.get('authors') or []) or meta.get('author', '')
+            book_title = meta.get('title', '') or title
+            book_year = f"({meta.get('year')})" if meta.get('year') else ''
+            book_format = (os.path.splitext(meta['path'])[1] or '').lstrip('.').upper()
+
+            if not book_format and meta.get('filelist'):
+                book_format = (os.path.splitext(next(iter(meta['filelist'])))[1] or '').lstrip('.').upper()
+
+            book_format = f"[{book_format}]" if book_format else ''
+
+            if meta['category'] == "AUDIOBOOK":
+                narrator = ', '.join(meta.get('narrators') or [])
+                narrator = f"{{{narrator}}}" if narrator else ''
+                name = f"{book_author} - {book_title} {book_year} {book_format} {narrator}"
+            else:
+                name = f"{book_author} - {book_title} {book_year} {book_format}"
+
         elif meta['category'] == "MUSIC": #MUSIC SPECIFIC
             source = f'{source} ' if source else ''
             no_tag = meta.get('no_tag')
@@ -3652,11 +4377,19 @@ class Prep():
             clean_name = self.clean_filename(name)
             name = name if not manual_name else manual_name             
             
-        except:
+        except Exception as e:                                  # noqa: BLE001
+            # Este bloque leía meta['source'] a pelo, y en una categoría sin
+            # vídeo esa clave no existe: el manejador reventaba con su propio
+            # KeyError y enterraba el error de verdad. Ahora lo enseña.
             console.print("[bold red]Unable to generate name. Please re-run and correct any of the following args if needed.")
-            console.print(f"--category [yellow]{meta['category']}")
-            console.print(f"--type [yellow]{meta['type']}")
-            console.print(f"--source [yellow]{meta['source']}")
+            # Nada de type(e) aquí: `type` es una variable local de esta
+            # función desde la primera línea y llamarla revienta con
+            # "'str' object is not callable", tapando otra vez el error real.
+            console.print(f"[bold red]Reason:[/bold red] {e.__class__.__name__}: {e}")
+            log.exception("get_name failed")
+            console.print(f"--category [yellow]{meta.get('category')}")
+            console.print(f"--type [yellow]{meta.get('type')}")
+            console.print(f"--source [yellow]{meta.get('source')}")
             name = "Error in Name Generation"
             # exit()
         return name_notag, name, clean_name, potential_missing

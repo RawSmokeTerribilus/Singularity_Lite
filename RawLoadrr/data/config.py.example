@@ -12,6 +12,11 @@ config = {
 "version": "1.0.7",
 
 "DEFAULT": {
+    "google_books_api": "YOUR_GOOGLE_BOOKS_API_KEY",
+    # Se sacan en dev.twitch.tv/console: IGDB va detrás de una app de
+    # Twitch, no tiene claves propias.
+    "igdb_client_id": "YOUR_TWITCH_CLIENT_ID",
+    "igdb_client_secret": "YOUR_TWITCH_CLIENT_SECRET",
     "tmdb_api": "YOUR_TMDB_API_KEY",
     "imgbb_api": "YOUR_IMGBB_API_KEY",
     "ptscreens_api": "YOUR_PTSCREENS_API_KEY",

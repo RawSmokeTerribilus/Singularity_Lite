@@ -92,6 +92,19 @@ class COMMON():
             if meta.get('is_music', False):
                 await self.create_music_description(meta, tracker)
 
+            # Books and games get the same treatment a film does -- artwork,
+            # synopsis and a technical dump -- because the description box is
+            # ours to fill; the header card above it is the tracker's job, and
+            # it builds that from the isbn13/asin/igdb in the payload.
+            #
+            # Unlike create_music_description() these write into the handle
+            # that is already open rather than reopening the file underneath
+            # it, so what they emit survives alongside the rest of this method.
+            if meta.get('is_book') or meta.get('is_audiobook'):
+                await self.write_book_description(descfile, meta)
+            elif meta.get('is_game'):
+                await self.write_game_description(descfile, meta)
+
             # Handle video trailers and logos
             if tracker not in ('AITHER', 'CBR', 'OE'):
                 add_trailer_enabled = self.config["DEFAULT"].get("add_trailer", False)    
@@ -158,6 +171,269 @@ class COMMON():
                     await descfile.write("\n" + signature)
 
         return
+
+    # ─── books, audiobooks and games ────────────────────────────────────────
+    @staticmethod
+    def _facts_line(pairs):
+        """
+        Join label/value pairs, dropping the empty ones.
+
+        Separated with a spaced middot on purpose. The tracker's own template
+        rendered this run together as "E-Books\u2022ES 916 paginas" and it is
+        unreadable; the space either side is the whole fix.
+        """
+        return " \u00b7 ".join(f"{label} {value}" for label, value in pairs
+                           if value not in (None, "", [], 0))
+
+    async def write_book_description(self, descfile, meta):
+        """
+        The book equivalent of screenshots + mediainfo.
+
+        Cover instead of screenshots (the artwork IS the visual), the synopsis
+        instead of a trailer, and the bookinfo dump instead of mediainfo -- it
+        answers the same question mediainfo answers for video: what are you
+        actually downloading, as opposed to which work is it.
+        """
+        is_audio = bool(meta.get('is_audiobook'))
+
+        cover = meta.get('cover_url') or ''
+        if not cover:
+            fallbacks = meta.get('cover_fallbacks') or []
+            cover = fallbacks[0] if fallbacks else ''
+
+        if cover:
+            await descfile.write(f"[center][img=400]{cover}[/img][/center]\n\n")
+
+        authors = ', '.join(meta.get('authors') or [])
+        title = meta.get('title') or ''
+        subtitle = meta.get('subtitle') or ''
+
+        heading = f"[b]{title}[/b]"
+        if subtitle:
+            heading += f" — {subtitle}"
+        if authors:
+            heading += f"\n{authors}"
+
+        await descfile.write(f"[center]{heading}[/center]\n\n")
+
+        if is_audio:
+            runtime = meta.get('runtime_min')
+            facts = [
+                ("Narra", ', '.join(meta.get('narrators') or [])),
+                ("Saga", meta.get('series')),
+                ("Editorial", meta.get('publisher')),
+                ("Año", meta.get('year')),
+                ("Duración", f"{runtime // 60} h {runtime % 60} min" if runtime else ""),
+                ("Idioma", (meta.get('language') or '').upper()),
+            ]
+        else:
+            facts = [
+                ("Editorial", meta.get('publisher')),
+                ("Año", meta.get('year')),
+                ("Páginas", meta.get('page_count')),
+                ("Idioma", (meta.get('language') or '').upper()),
+            ]
+
+        line = self._facts_line(facts)
+        if line:
+            await descfile.write(f"[center]{line}[/center]\n\n")
+
+        # Una lectura libre no está en ningún catálogo comercial, pero la obra
+        # sí: la portada y la sinopsis de arriba son del libro y valen igual.
+        # Lo único que no se puede afirmar es la grabación, y se dice.
+        if meta.get('lectura_libre'):
+            await descfile.write(
+                "[center][i]Lectura libre: esta grabación no figura en ningún "
+                "catálogo comercial. La portada y la sinopsis son de la obra; "
+                "el narrador no está identificado.[/i][/center]\n\n")
+
+        genres = meta.get('genres') or []
+        if genres:
+            await descfile.write(f"[center][i]{' · '.join(str(g) for g in genres[:8])}[/i][/center]\n\n")
+
+        synopsis = (meta.get('description') or '').strip()
+        if synopsis:
+            await descfile.write(f"[quote]{synopsis}[/quote]\n\n")
+
+        await self._write_bookinfo(descfile, meta)
+
+        await self._provider_badges(descfile, meta)
+
+    # Etiquetas legibles y ORDEN fijo. Un volcado de un diccionario sale en el
+    # orden en que se rellenó, que no es el orden en que se lee.
+    _BOOKINFO_CAMPOS = [
+        ('formato',     'Formato'),
+        ('codec',       'Códec'),
+        ('duracion',    'Duración'),
+        ('capitulos',   'Capítulos'),
+        ('bitrate',     'Bitrate'),
+        ('frecuencia',  'Frecuencia'),
+        ('canales',     'Canales'),
+        ('mb_por_hora', 'MB por hora'),
+        ('bytes',       'Tamaño'),
+        ('paginas',     'Páginas'),
+        ('version',     'Versión EPUB'),
+        ('maquetado',   'Maquetado'),
+        ('drm',         'DRM'),
+        ('capa_texto',  'Capa de texto'),
+        ('escaneo',     'Escaneo sin OCR'),
+        ('pct_texto',   'Proporción de texto'),
+        ('imagenes',    'Imágenes'),
+        ('fuentes',     'Fuentes'),
+    ]
+
+    async def _write_bookinfo(self, descfile, meta):
+        """
+        El bloque técnico, que es el mediainfo de un libro o de un audiolibro.
+
+        Antes era un volcado crudo del diccionario, con las claves tal cual y
+        en orden de relleno. Y en un audiolibro no decía NADA útil -- ni
+        duración, ni bitrate, ni capítulos -- porque el análisis de audio no
+        existía: se anunciaba con el formato y el tamaño, que no distinguen una
+        lectura de 126 kbps de otra de 63.
+        """
+        info = meta.get('bookinfo') or {}
+        if not info:
+            return
+
+        filas = []
+
+        for clave, etiqueta in self._BOOKINFO_CAMPOS:
+            if clave not in info:
+                continue
+
+            valor = info[clave]
+
+            if valor in (None, ""):
+                continue
+
+            if clave == 'bytes':
+                valor = f"{int(valor) / (1024 * 1024):.2f} MiB"
+            elif clave == 'pct_texto':
+                valor = f"{valor}%"
+            elif clave == 'mb_por_hora':
+                valor = f"{valor} MiB/h"
+            elif isinstance(valor, bool):
+                valor = "sí" if valor else "no"
+
+            filas.append((etiqueta, valor))
+
+        # Lo que no esté en la lista de arriba se enseña igual, al final:
+        # más vale un campo con nombre feo que un campo perdido.
+        conocidas = {c for c, _e in self._BOOKINFO_CAMPOS}
+        for clave, valor in info.items():
+            # `duracion_min` es para desempatar grabaciones, no para leerla.
+            if clave in conocidas or clave.endswith('_min') or valor in (None, "", [], {}):
+                continue
+            filas.append((clave.replace('_', ' ').capitalize(), valor))
+
+        if not filas:
+            return
+
+        ancho = max(len(e) for e, _v in filas)
+
+        await descfile.write("[spoiler=BookInfo][code]\n")
+        for etiqueta, valor in filas:
+            await descfile.write(f"{etiqueta:<{ancho}} : {valor}\n")
+        await descfile.write("[/code][/spoiler]\n\n")
+
+    async def _provider_badges(self, descfile, meta):
+        """
+        Enlaces a la ficha del proveedor. TEXTO, no logos.
+
+        Los logos duraron una subida. Medido: el favicon de IGDB devuelve 403
+        (Cloudflare corta el enlazado en caliente, así que el proxy de imágenes
+        del tracker tampoco puede) y el SVG de Audible que había, 404. Google y
+        OpenLibrary aguantaban, con lo que quedaba una fila donde la mitad de
+        los iconos no pintaban nada -- peor que no tener fila.
+
+        Alojarlos nosotros no vale aquí: `COMMON.py` lo comparten los 52
+        trackers, y `public/img/meta/*.svg` sólo existe en uno. El texto no
+        depende de nadie.
+        """
+        enlaces = []
+
+        volume_id = meta.get('volume_id')
+        if volume_id:
+            enlaces.append(("Google Books", f"https://books.google.com/books?id={volume_id}"))
+
+        # OpenLibrary sólo si de verdad tiene el libro. Medido sobre cuatro
+        # ISBN españoles reales: TRES devuelven 404 en la página. Enlazarlo
+        # siempre es mandar al lector a una página que no existe, y en un
+        # catálogo en castellano eso es la norma, no la excepción.
+        #
+        # El `olid` es la prueba: sólo lo hay si OpenLibrary contestó.
+        if meta.get('olid'):
+            enlaces.append(("OpenLibrary", f"https://openlibrary.org/works/{meta['olid']}"))
+
+        asin = meta.get('asin')
+        if asin:
+            enlaces.append(("Audible", f"https://www.audible.es/pd/{asin}"))
+
+        igdb_slug = meta.get('igdb_slug')
+        if igdb_slug:
+            enlaces.append(("IGDB", f"https://www.igdb.com/games/{igdb_slug}"))
+
+        if not enlaces:
+            return
+
+        fila = " · ".join(f"[url={url}]{nombre}[/url]" for nombre, url in enlaces)
+        await descfile.write(f"[center][size=2]{fila}[/size][/center]\n\n")
+
+    async def write_game_description(self, descfile, meta):
+        """
+        Cover + synopsis + trailer + gameinfo.
+
+        The screenshots are not written here: they are pushed into
+        meta['image_list'] upstream so the same loop that renders a film's
+        screenshots renders them, image host cascade and all.
+        """
+        cover = meta.get('cover_url') or ''
+        if cover:
+            await descfile.write(f"[center][img=400]{cover}[/img][/center]\n\n")
+
+        title = meta.get('title') or ''
+        await descfile.write(f"[center][b]{title}[/b][/center]\n\n")
+
+        line = self._facts_line([
+            ("Plataforma", ', '.join(meta.get('platforms') or [])),
+            ("Año", meta.get('year')),
+            ("Estudio", ', '.join(meta.get('companies') or [])),
+        ])
+        if line:
+            await descfile.write(f"[center]{line}[/center]\n\n")
+
+        genres = meta.get('genres') or []
+        if genres:
+            await descfile.write(f"[center][i]{' · '.join(str(g) for g in genres[:8])}[/i][/center]\n\n")
+
+        synopsis = (meta.get('description') or '').strip()
+        if synopsis:
+            await descfile.write(f"[quote]{synopsis}[/quote]\n\n")
+
+        trailer = meta.get('trailer')
+        if trailer:
+            await descfile.write(f"[center][youtube]{trailer}[/youtube][/center]\n\n")
+
+        info = meta.get('gameinfo') or {}
+        if info:
+            await descfile.write("[spoiler=GameInfo][code]\n")
+            for key, value in info.items():
+                if value in (None, "", []):
+                    continue
+                if key == 'entradas':
+                    await descfile.write(f"{'contenido':<12}: {len(value)} ficheros\n")
+                    for entry in value[:60]:
+                        await descfile.write(f"  {entry['crc32']}  {entry['bytes']:>12}  {entry['nombre']}\n")
+                    if len(value) > 60:
+                        await descfile.write(f"  ... y {len(value) - 60} más\n")
+                    continue
+                if key == 'bytes':
+                    value = f"{int(value) / (1024 * 1024):.2f} MiB"
+                await descfile.write(f"{key.replace('_', ' '):<12}: {value}\n")
+            await descfile.write("[/code][/spoiler]\n\n")
+
+        await self._provider_badges(descfile, meta)
 
     async def create_music_description(self, meta, tracker):
         async with aiofiles.open(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}]DESCRIPTION.txt", 'w', encoding='utf-8') as descfile:

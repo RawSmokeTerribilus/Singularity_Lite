@@ -178,7 +178,7 @@ except Exception as e:
     console.print(f"[bold red]Error initializing client or parser: {e}[/bold red]")
     sys.exit(1)
 
-def build_recursive_queue(root_path):
+def build_recursive_queue(root_path, only=None):
     """
     Recursively scans a directory to build a queue of items to upload.
     - Identifies TV Show seasons and adds them as season packs.
@@ -187,7 +187,42 @@ def build_recursive_queue(root_path):
     """
     queue = []
     video_extensions = ('.mkv', '.mp4', '.avi', '.ts', '.m2ts', '.m4v')
-    season_patterns = [r'S[0-9]+', r'Season[\s-]*[0-9]+']
+    # An e-book or an audiobook is a perfectly good upload, but nothing that is
+    # not video ever reached this queue, so the walk below skipped whole
+    # directories of them in silence. Comics and manga ride along with the
+    # e-books: electronic is electronic, and only the tracker category differs.
+    book_extensions = ('.epub', '.mobi', '.azw3', '.azw', '.pdf', '.cbz', '.cbr', '.djvu', '.fb2')
+    audiobook_extensions = ('.m4b',)
+    # Las inequívocas entran SIEMPRE; las ambiguas (.iso, .cue, .bin...) sólo
+    # cuando se ha declarado que se va a por juegos. Una sola fuente de verdad,
+    # en gameinfo.
+    from src import gameinfo as _gi
+    from src import bookinfo as _bi
+
+    quiere_audio = bool(only) and 'audiobook' in only
+
+    # "all" no es un tipo, es la ausencia de filtro. El resolver ya lo traduce,
+    # pero esta función es pública y la llaman de fuera: si no se defiende
+    # sola, `--only all` acaba filtrando por un tipo que no existe y devuelve
+    # una cola vacía sin decir por qué.
+    if only and 'all' in only:
+        only = None
+
+    game_mode = bool(only) and 'game' in only
+    game_extensions = _gi.GAME_EXTS if game_mode else _gi.GAME_EXTS_AUTO
+
+    def _quiere(kind):
+        """Sin --only se busca de todo; con él, sólo lo pedido."""
+        return not only or kind in only
+    upload_extensions = video_extensions + book_extensions + audiobook_extensions
+    # Sonarr names in English, so our own catalogue (1164 Season-N dirs) never
+    # walked the failing branch. A Spanish "Temporada 1" did not match, so the
+    # folder was not a season pack and its 22 episodes were queued one by one --
+    # which is exactly how a member of a Spanish-speaking tracker found it.
+    season_patterns = [
+        r'S[0-9]+',
+        r'(?:Season|Temporada|Staffel|Saison|Stagione|Seizoen|Sezon)[\s._-]*[0-9]+',
+    ]
     
     processed_paths = set()
 
@@ -221,8 +256,60 @@ def build_recursive_queue(root_path):
             # process loose files in the same directory as season folders.
             continue
 
+        # An audiobook is normally one folder of many .m4b chapters and has to
+        # be queued as the folder, exactly like a season pack: queueing the
+        # chapters individually would upload one torrent per chapter.
+        # No basta la extensión: el primer audiolibro real que se probó era un
+        # .m4a, que es también música. Lo decide bookinfo mirando contenedor,
+        # nombre, etiquetas y duración.
+        audiobook_files = ([f for f in filenames
+                            if _bi.looks_like_audiobook(os.path.join(dirpath, f),
+                                                        declared=quiere_audio)]
+                           if _quiere('audiobook') else [])
+
+        if audiobook_files:
+            # Varios ficheros de audio en una carpeta son DOS cosas muy
+            # distintas: los capítulos de un audiolibro, que son una obra, o
+            # varios audiolibros sueltos, que son varias. Se distinguen por el
+            # título de sus etiquetas -- los capítulos comparten el del libro.
+            #
+            # Medido: tres .m4b de Laura Gallego en una carpeta se encolaban
+            # como UN torrent de la carpeta entera.
+            carpeta_entera = False
+
+            for grupo in _bi.agrupar_audiolibros(dirpath, audiobook_files):
+                if len(grupo) == 1:
+                    queue.append(os.path.join(dirpath, grupo[0]))
+                else:
+                    queue.append(dirpath)
+                    carpeta_entera = True
+
+            # Dejar de bajar sólo tiene sentido si la carpeta ENTERA es una
+            # obra (sus capítulos). Si lo que hay son varias obras sueltas, los
+            # subdirectorios pueden tener más cosas y hay que seguir mirando:
+            # cortando aquí se perdía el e-book que colgaba de una subcarpeta.
+            if carpeta_entera:
+                processed_paths.add(dirpath)
+                dirnames.clear()
+            # OJO: aquí NO se hace `continue`. Una carpeta puede tener el
+            # audiolibro y el e-book de la misma obra, y son dos torrents
+            # distintos: cortar aquí es lo que hacía que sólo subiera el pdf.
+
+        # E-books are the opposite: several files in one folder are several
+        # different books, not one book in parts, so each is its own upload.
+        book_files = ([f for f in filenames if f.lower().endswith(book_extensions)]
+                      if _quiere('book') else [])
+
+        if book_files:
+            for f in book_files:
+                queue.append(os.path.join(dirpath, f))
+
+        if audiobook_files or book_files:
+            continue
+
         # If not a season/show folder, check for movies or loose files
-        video_files = [f for f in filenames if f.lower().endswith(video_extensions)]
+        video_files = ([f for f in filenames if f.lower().endswith(video_extensions)]
+                       if _quiere('video') else [])
         if video_files:
             if len(video_files) > 1:
                 # This directory contains multiple videos. Treat them as loose files.
@@ -235,8 +322,142 @@ def build_recursive_queue(root_path):
                 # Since this is a self-contained movie, don't descend into its subdirectories.
                 processed_paths.add(dirpath)
                 dirnames.clear()
-                
+
+            continue
+
+        # Los juegos van los ÚLTIMOS, después de vídeo, y no por capricho: una
+        # carpeta de pelis con un `caratulas.zip` suelto encolaría el zip como
+        # juego si esto fuera antes. Si el directorio tiene vídeo, es de vídeo.
+        #
+        # Como los e-books, un archivo es una obra: una carpeta con 77 zips de
+        # ScummVM son 77 juegos distintos, no uno en partes.
+        game_files = ([f for f in filenames if f.lower().endswith(game_extensions)]
+                      if _quiere('game') else [])
+
+        if game_files:
+            for f in game_files:
+                queue.append(os.path.join(dirpath, f))
+
+            continue
+
+        # Un directorio hoja con los ficheros sueltos de un juego (el caso de
+        # ScummVM instalado, sin comprimir) es UNA obra, así que va entero.
+        # Sólo con --category game: sin él, cualquier carpeta de basura del
+        # árbol acabaría en la cola.
+        if game_mode and _quiere('game') and filenames and not dirnames:
+            queue.append(dirpath)
+            processed_paths.add(dirpath)
+
+            continue
+
     return sorted(list(set(queue)))
+
+
+def _resolver_only(meta, root_path):
+    """
+    Qué tipos hay que buscar en este árbol.
+
+    -> lista de tipos, `[]` para "todo", o `None` para cancelar la tirada.
+
+    Existe por un accidente muy concreto: apuntar esto a la carpeta de
+    descargas. Una biblioteca ordenada es homogénea y no ve nada de esto nunca;
+    una carpeta de cajón desastre trae vídeos, PDFs de facturas y zips sueltos,
+    y encolarlo todo junto es como se sube un contrato a un tracker público.
+
+    Con --only ya declarado no se pregunta. Sin él, sólo se para si hay MEZCLA:
+    un solo tipo no es ambiguo y no hay nada que consultar.
+    """
+    from src import library
+
+    # args.py aplana TODA lista a una cadena, así que `--only audiobook` llega
+    # como "audiobook" y no como ["audiobook"]. Iterarlo daba letras sueltas
+    # --['a','u','d',...]-- y la cola salía vacía sin decir por qué.
+    crudo = meta.get('only') or []
+    if isinstance(crudo, str):
+        crudo = crudo.replace(',', ' ').split()
+
+    only = [k for k in crudo if k]
+    if 'all' in only:
+        return []
+    if only:
+        return only
+
+    # --category game sigue valiendo como declaración, que es como se venía
+    # usando antes de que existiera --only.
+    if str(meta.get('category') or '').upper() == 'GAME':
+        return ['game']
+
+    found = library.scan(root_path)
+    if not library.is_mixed(found):
+        return []
+
+    kinds = [k for k, _n in library.counts(found)]
+
+    console.print()
+    console.print(Panel(
+        library.describe(found),
+        title="[bold yellow]Aquí hay de todo[/bold yellow]",
+        border_style="bold yellow", box=box.DOUBLE))
+    console.print("[dim]Subir tipos distintos en la misma tirada casi nunca es lo que "
+                  "se quiere: así es como se cuela una factura entre las películas.[/dim]")
+
+    if meta.get('unattended'):
+        console.print("[bold red]Modo desatendido y sin --only: no se adivina. "
+                      "Vuelve a lanzarlo con --only "
+                      f"{'|'.join(kinds)} (o --only all).[/bold red]")
+        return None
+
+    for n, kind in enumerate(kinds, 1):
+        console.print(f"  [bold cyan]{n}[/bold cyan]  sólo {library.LABELS[kind]}")
+    console.print(f"  [bold cyan]{len(kinds) + 1}[/bold cyan]  todo, lo quiero así")
+    console.print(f"  [bold cyan]{len(kinds) + 2}[/bold cyan]  cancelar")
+
+    opciones = [str(i) for i in range(1, len(kinds) + 3)]
+    elegido = Prompt.ask("[bold]Opción[/bold]", choices=opciones, default="1")
+    idx = int(elegido)
+
+    if idx <= len(kinds):
+        return [kinds[idx - 1]]
+    if idx == len(kinds) + 1:
+        return []
+
+    console.print("[yellow]Cancelado.[/yellow]")
+    return None
+
+
+async def tracker_admite(tracker_class, meta):
+    """
+    ¿Este tracker acepta lo que se le va a subir?
+
+    -> mensaje de por qué no, o None si sí.
+
+    Un libro, un audiolibro o un juego no se pueden subir a un tracker que
+    sólo cataloga vídeo, y hasta ahora eso no se comprobaba: se le pasaba el
+    meta igual y reventaba con KeyError('tmdb') a mitad del dupe check --
+    medido, 33 de los 52 módulos leen esa clave a pelo y 46 abren MEDIAINFO.txt
+    sin guarda.
+
+    La comprobación va aquí y no en cada módulo por lo mismo: son 52 ficheros
+    y la mitad son de terceros. La convención ya existía -- `get_cat_id()`
+    devuelve '0' cuando no reconoce la categoría -- así que basta con
+    preguntarle antes de tocar nada, y un tracker gana soporte de libros el
+    día que su get_cat_id() sepa contestar.
+    """
+    categoria = str(meta.get('category') or '').upper()
+
+    if categoria not in ('BOOK', 'AUDIOBOOK', 'GAME'):
+        return None
+
+    try:
+        cat_id = await tracker_class.get_cat_id(categoria, meta)
+    except Exception:                                           # noqa: BLE001
+        cat_id = None
+
+    if str(cat_id or '0') != '0':
+        return None
+
+    return (f"{tracker_class.tracker} no tiene categoría para {categoria}: "
+            f"se salta este tracker")
 
 
 async def do_the_thing(base_dir):
@@ -273,7 +494,10 @@ async def do_the_thing(base_dir):
             if os.path.isdir(root_path):
                 console.print(Rule("[bold green]RECURSIVE SCAN INITIATED[/bold green]", style="green"))
                 console.print(f"[dim]Scanning:[/dim] [cyan]{root_path}[/cyan]")
-                queue = build_recursive_queue(root_path)
+                only = _resolver_only(meta, root_path)
+                if only is None:
+                    return
+                queue = build_recursive_queue(root_path, only=only)
             else: # It's a file
                 queue.append(root_path)
         else:
@@ -373,6 +597,20 @@ async def do_the_thing(base_dir):
         if meta.get('tmdb_not_found'):
             skipped_files += 1
             skipped_tmdb_files.append(path)
+            continue
+
+        # Sin id determinante no se sube. La extensión no distingue un
+        # "Contrato.pdf" de "El Quijote.pdf" y nunca lo hará; quien sabe si eso
+        # es una obra es el proveedor, y si no la reconoce, no lo es.
+        #
+        # Se salta ESTE item, no la tirada: en un lote de 78 juegos uno sin
+        # identificar no puede tumbar los otros 77.
+        if meta.get('id_not_found') and not meta.get('allow_no_id'):
+            skipped_files += 1
+            skipped_details.append((path, f"Sin id: {meta['id_not_found']}"))
+            console.print(f"[bold red]Saltado[/bold red] — {meta['id_not_found']}. "
+                          f"[dim]Pásale el id a mano (--isbn / --asin / --igdb) "
+                          f"o usa --allow-no-id si de verdad quieres subirlo sin él.[/dim]")
             continue
 
         try:
@@ -477,8 +715,13 @@ async def do_the_thing(base_dir):
                     continue
                 tracker_class = tracker_class_map[tracker](config=config)
                 # Auto-upload by default (unless debug mode without unattended flag)
-                if meta.get('debug', False) and not meta.get('unattended', False):
-                    upload_to_tracker = Confirm.ask(f"Upload to {tracker_class.tracker}? {debug}")
+                # --debug NUNCA ha impedido subir: sólo convertía la subida en una
+                # pregunta, y con --unattended ni eso, así que el flag que promete
+                # ensayo desarmaba justo el guardarraíl. Sin nadie a quien
+                # preguntar, la respuesta segura es no.
+                if meta.get('debug', False):
+                    upload_to_tracker = (Confirm.ask(f"Upload to {tracker_class.tracker}? {debug}")
+                                         if not meta.get('unattended', False) else False)
                 else:
                     upload_to_tracker = True
                 if upload_to_tracker:
@@ -491,6 +734,12 @@ async def do_the_thing(base_dir):
                 if check_banned_group(tracker_class.tracker, tracker_class.banned_groups, meta, skipped_details, path):
                     skipped_files += 1
                     skipped_details.append((path, f"Banned Group on {tracker_class.tracker}"))
+                    continue
+                motivo = await tracker_admite(tracker_class, meta)
+                if motivo:
+                    console.print(f"[bold yellow]{motivo}[/bold yellow]")
+                    skipped_files += 1
+                    skipped_details.append((path, motivo))
                     continue
                 dupes = await tracker_class.search_existing(meta)
                 if not meta.get('is_music', False):
@@ -556,8 +805,13 @@ async def do_the_thing(base_dir):
             if tracker in tracker_data['http']:
                 tracker_class = tracker_class_map[tracker](config=config)
                 # Auto-upload by default (unless debug mode without unattended flag)
-                if meta.get('debug', False) and not meta.get('unattended', False):
-                    upload_to_tracker = Confirm.ask(f"Upload to {tracker_class.tracker}? {debug}", choices=["y", "N"])
+                # --debug NUNCA ha impedido subir: sólo convertía la subida en una
+                # pregunta, y con --unattended ni eso, así que el flag que promete
+                # ensayo desarmaba justo el guardarraíl. Sin nadie a quien
+                # preguntar, la respuesta segura es no.
+                if meta.get('debug', False):
+                    upload_to_tracker = (Confirm.ask(f"Upload to {tracker_class.tracker}? {debug}", choices=["y", "N"])
+                                         if not meta.get('unattended', False) else False)
                 else:
                     upload_to_tracker = True
                 if upload_to_tracker:
@@ -567,6 +821,12 @@ async def do_the_thing(base_dir):
                         skipped_details.append((path, f"Banned group on {tracker_class.tracker}"))                        
                         continue
                     if await tracker_class.validate_credentials(meta):
+                        motivo = await tracker_admite(tracker_class, meta)
+                        if motivo:
+                            console.print(f"[bold yellow]{motivo}[/bold yellow]")
+                            skipped_files += 1
+                            skipped_details.append((path, motivo))
+                            continue
                         dupes = await tracker_class.search_existing(meta)
                         dupes = await common.filter_dupes(dupes, meta)
                         meta, skipped = dupe_check(dupes, meta, config, skipped_details, path)
@@ -604,8 +864,13 @@ async def do_the_thing(base_dir):
             if tracker == "AR":
                 ar = tracker_class_map[tracker](config=config)
                 # Auto-upload by default (unless debug mode without unattended flag)
-                if meta.get('debug', False) and not meta.get('unattended', False):
-                    upload_to_ar = Confirm.ask(f"Upload to AlphaRatio? {debug}", choices=["y", "N"])
+                # --debug NUNCA ha impedido subir: sólo convertía la subida en una
+                # pregunta, y con --unattended ni eso, así que el flag que promete
+                # ensayo desarmaba justo el guardarraíl. Sin nadie a quien
+                # preguntar, la respuesta segura es no.
+                if meta.get('debug', False):
+                    upload_to_ar = (Confirm.ask(f"Upload to AlphaRatio? {debug}", choices=["y", "N"])
+                                    if not meta.get('unattended', False) else False)
                 else:
                     upload_to_ar = True
                 if upload_to_ar:
@@ -616,6 +881,12 @@ async def do_the_thing(base_dir):
                         continue
                 console.print("[yellow]Searching for Existing Releases")
                 if await ar.validate_credentials(meta):
+                    motivo = await tracker_admite(ar, meta)
+                    if motivo:
+                        console.print(f"[bold yellow]{motivo}[/bold yellow]")
+                        skipped_files += 1
+                        skipped_details.append((path, motivo))
+                        continue
                     dupes = await ar.search_existing(meta)
                     dupes = await common.filter_dupes(dupes, meta)
                     meta, skipped = dupe_check(dupes, meta, config, skipped_details, path)
@@ -637,8 +908,13 @@ async def do_the_thing(base_dir):
                 draft_int = await bhd.get_live(meta)
                 draft = "Draft" if draft_int == 0 else "Live"
                 # Auto-upload by default (unless debug mode without unattended flag)
-                if meta.get('debug', False) and not meta.get('unattended', False):
-                    upload_to_bhd = Confirm.ask(f"Upload to BHD? ({draft}) {debug}")
+                # --debug NUNCA ha impedido subir: sólo convertía la subida en una
+                # pregunta, y con --unattended ni eso, así que el flag que promete
+                # ensayo desarmaba justo el guardarraíl. Sin nadie a quien
+                # preguntar, la respuesta segura es no.
+                if meta.get('debug', False):
+                    upload_to_bhd = (Confirm.ask(f"Upload to BHD? ({draft}) {debug}")
+                                     if not meta.get('unattended', False) else False)
                 else:
                     upload_to_bhd = True
                 if upload_to_bhd:
@@ -646,6 +922,12 @@ async def do_the_thing(base_dir):
                     if check_banned_group("BHD", bhd.banned_groups, meta, skipped_details, path):
                         skipped_files += 1
                         skipped_details.append((path, f"Banned group on {bhd.tracker}")) 
+                        continue
+                    motivo = await tracker_admite(bhd, meta)
+                    if motivo:
+                        console.print(f"[bold yellow]{motivo}[/bold yellow]")
+                        skipped_files += 1
+                        skipped_details.append((path, motivo))
                         continue
                     dupes = await bhd.search_existing(meta)
                     dupes = await common.filter_dupes(dupes, meta)
@@ -661,8 +943,13 @@ async def do_the_thing(base_dir):
             
             if tracker == "THR":
                 # Auto-upload by default (unless debug mode without unattended flag)
-                if meta.get('debug', False) and not meta.get('unattended', False):
-                    upload_to_thr = Confirm.ask(f"Upload to THR? {debug}")
+                # --debug NUNCA ha impedido subir: sólo convertía la subida en una
+                # pregunta, y con --unattended ni eso, así que el flag que promete
+                # ensayo desarmaba justo el guardarraíl. Sin nadie a quien
+                # preguntar, la respuesta segura es no.
+                if meta.get('debug', False):
+                    upload_to_thr = (Confirm.ask(f"Upload to THR? {debug}")
+                                     if not meta.get('unattended', False) else False)
                 else:
                     upload_to_thr = True
                 if upload_to_thr:
@@ -717,8 +1004,13 @@ async def do_the_thing(base_dir):
 
             if tracker == "PTP":
                 # Auto-upload by default (unless debug mode without unattended flag)
-                if meta.get('debug', False) and not meta.get('unattended', False):
-                    upload_to_ptp = Confirm.ask(f"Upload to {tracker}? {debug}")
+                # --debug NUNCA ha impedido subir: sólo convertía la subida en una
+                # pregunta, y con --unattended ni eso, así que el flag que promete
+                # ensayo desarmaba justo el guardarraíl. Sin nadie a quien
+                # preguntar, la respuesta segura es no.
+                if meta.get('debug', False):
+                    upload_to_ptp = (Confirm.ask(f"Upload to {tracker}? {debug}")
+                                     if not meta.get('unattended', False) else False)
                 else:
                     upload_to_ptp = True
                 if upload_to_ptp:
@@ -785,8 +1077,13 @@ async def do_the_thing(base_dir):
             if tracker == "TL":
                 tracker_class = tracker_class_map[tracker](config=config)
                 # Auto-upload by default (unless debug mode without unattended flag)
-                if meta.get('debug', False) and not meta.get('unattended', False):
-                    upload_to_tracker = Confirm.ask(f"Upload to {tracker_class.tracker}? {debug}")
+                # --debug NUNCA ha impedido subir: sólo convertía la subida en una
+                # pregunta, y con --unattended ni eso, así que el flag que promete
+                # ensayo desarmaba justo el guardarraíl. Sin nadie a quien
+                # preguntar, la respuesta segura es no.
+                if meta.get('debug', False):
+                    upload_to_tracker = (Confirm.ask(f"Upload to {tracker_class.tracker}? {debug}")
+                                         if not meta.get('unattended', False) else False)
                 else:
                     upload_to_tracker = True
                 if upload_to_tracker:
@@ -912,6 +1209,24 @@ def get_confirmation(meta):
             db_info.append(f"\n[bold]MBID[/bold]: https://musicbrainz.org/release/{meta['mbid']}")
         if meta.get('discogs_url'):
             db_info.append(f"[bold]Discogs[/bold]: {meta['discogs_url']}")
+    elif meta.get('is_book') or meta.get('is_audiobook'):
+        db_info = [
+            f"[bold]Title[/bold]: {meta.get('title', '?')} ({meta.get('year') or 's/f'})",
+            f"[bold]Author[/bold]: {', '.join(meta.get('authors') or []) or '?'}",
+            f"[bold]Category[/bold]: {meta['category']}",
+        ]
+        if meta.get('narrators'):
+            db_info.append(f"[bold]Narrator[/bold]: {', '.join(meta['narrators'])}")
+        if meta.get('description'):
+            db_info.append(f"\n[bold]Overview[/bold]: {meta['description'][:400]}")
+    elif meta.get('is_game'):
+        db_info = [
+            f"[bold]Title[/bold]: {meta.get('title', '?')} ({meta.get('year') or 's/f'})",
+            f"[bold]System[/bold]: {', '.join(meta.get('platforms') or []) or '?'}",
+            f"[bold]Category[/bold]: {meta['category']}",
+        ]
+        if meta.get('description'):
+            db_info.append(f"\n[bold]Overview[/bold]: {meta['description'][:400]}")
     else: 
         db_info = [
             f"[bold]Title[/bold]: {meta['title']} ({meta['year']})\n",
@@ -919,20 +1234,29 @@ def get_confirmation(meta):
             f"[bold]Category[/bold]: {meta['category']}\n",
         ]
 
-    if int(meta.get('tmdb', 0)) != 0:
+    # Todos éstos son ids de vídeo y en un libro o un juego no existen. Los
+    # int(meta.get(x, '0')) revientan en cuanto la clave está PRESENTE puesta a
+    # None, que es justo como la deja args.py: el default de get() no entra.
+    if int(meta.get('tmdb') or 0) != 0:
         db_info.append(f"TMDB: https://www.themoviedb.org/{meta['category'].lower()}/{meta['tmdb']}")
-    if int(meta.get('imdb_id', '0')) != 0:
+    if int(meta.get('imdb_id') or 0) != 0:
         db_info.append(f"IMDB: https://www.imdb.com/title/tt{meta['imdb_id']}")
-    if int(meta.get('tvdb_id', '0')) != 0:
+    if int(meta.get('tvdb_id') or 0) != 0:
         db_info.append(f"TVDB: https://www.thetvdb.com/?id={meta['tvdb_id']}&tab=series")
-    if int(meta.get('mal_id', 0)) != 0:
+    if int(meta.get('mal_id') or 0) != 0:
         db_info.append(f"MAL : https://myanimelist.net/anime/{meta['mal_id']}")
+    if meta.get('isbn13') or meta.get('isbn'):
+        db_info.append(f"ISBN: https://openlibrary.org/isbn/{meta.get('isbn13') or meta.get('isbn')}")
+    if meta.get('asin'):
+        db_info.append(f"ASIN: https://www.audible.es/pd/{meta['asin']}")
+    if meta.get('igdb'):
+        db_info.append(f"IGDB: https://www.igdb.com/games/{meta.get('igdb_slug') or meta['igdb']}")
 
     console.print(Panel("\n".join(db_info), title="[bold]DATABASE INFO[/bold]", border_style="bold yellow", box=box.DOUBLE))
     console.print()
-    if int(meta.get('freeleech', '0')) != 0:
+    if int(meta.get('freeleech') or 0) != 0:
         console.print(f"[bold]Freeleech[/bold]: {meta['freeleech']}")
-    if meta['tag'] == "":
+    if not meta.get('tag'):
             tag = ""
     else:
         tag = f" / {meta['tag'][1:]}"
@@ -1110,7 +1434,7 @@ def extract_size_from_torrent(base_dir, uuid):
 
 # Return True if banned group
 def check_banned_group(tracker, banned_group_list, meta, skipped_details, path):
-    if meta['tag'] == "":
+    if not meta.get('tag'):
         return False
     else:
         q = False

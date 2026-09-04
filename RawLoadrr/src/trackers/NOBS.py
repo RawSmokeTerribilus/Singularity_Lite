@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import re
 import requests
 import json
 import os
@@ -22,13 +23,28 @@ class NOBS():
         self.logger = get_logger(self.tracker)
         pass
     
+    # Read from the tracker's filter API on 2026-08-22, never from the admin
+    # panel: that column is a display index, and taking it literally once put a
+    # findOrFail(0) 404 in front of every MILNU upload.
+    CATEGORY_IDS = {
+        'MOVIE': '1', 'TV': '2', 'GAME': '3',
+        'ANIME_MOVIE': '4', 'ANIME_TV': '5',
+        'BOOK': '7', 'AUDIOBOOK': '8',
+    }
+
     async def get_cat_id(self, category_name, meta=None):
         is_anime = bool(meta and (meta.get('anime') or int(meta.get('mal_id') or 0) != 0))
         if category_name == 'MOVIE':
-            return '4' if is_anime else '1'
+            return self.CATEGORY_IDS['ANIME_MOVIE'] if is_anime else self.CATEGORY_IDS['MOVIE']
         elif category_name == 'TV':
-            return '5' if is_anime else '2'
-        return '0'
+            return self.CATEGORY_IDS['ANIME_TV'] if is_anime else self.CATEGORY_IDS['TV']
+        return self.CATEGORY_IDS.get(category_name, '0')
+
+    def is_non_video(self, meta):
+        """A book, an audiobook or a game: no disc, no resolution, no mediainfo."""
+        return (meta.get('category') in ('BOOK', 'AUDIOBOOK', 'GAME')
+                or meta.get('is_book') or meta.get('is_audiobook')
+                or meta.get('is_game'))
 
     async def get_type_id(self, type):
         type_id = {
@@ -37,11 +53,26 @@ class NOBS():
             'WEBDL': '4', 
             'WEBRIP': '5', 
             'HDTV': '6',
-            'ENCODE': '3'
+            'ENCODE': '3',
+            # Books are typed by container, not by "book": the tracker keeps
+            # EPUB and PDF as different things because they are.
+            'EPUB': '7',
+            'PDF': '8',
+            'MOBI': '9',
+            'AZW3': '10',
+            'CBZ/CBR': '11',
+            'M4B': '12',
+            'MP3': '13',
+            # Games, by how you run them rather than by platform.
+            'SCUMMVM': '14',
+            'ROM': '15',
+            'PC': '16',
             }.get(type, '0')
         return type_id
 
     async def get_res_id(self, resolution):
+        # id 10 is "Other" on this tracker, not 8640p -- checked against the
+        # resolutions table, not inferred from the ordering.
         resolution_id = {
             '8640p':'10', 
             '4320p': '1', 
@@ -61,12 +92,42 @@ class NOBS():
     ######   STOP HERE UNLESS EXTRA MODIFICATION IS NEEDED   ######
     ###############################################################
 
+    @staticmethod
+    def _isbn13(meta):
+        """
+        13 dígitos y nada más; la API valida la forma, no el libro.
+
+        `isbn13_obra` es el del LIBRO cuando lo que se sube es una lectura
+        libre: la grabación no está en ningún catálogo y no tiene ASIN, pero
+        la obra sí tiene ISBN y con él el tracker saca portada, sinopsis y
+        autor. Va el último porque sólo aplica cuando no hay nada mejor.
+        """
+        for clave in ('isbn13', 'isbn', 'isbn13_obra'):
+            raw = re.sub(r'[^0-9]', '', str(meta.get(clave) or ''))
+            if len(raw) == 13:
+                return raw
+
+        return None
+
+    @staticmethod
+    def _asin(meta):
+        """Audible ASINs are exactly 10 alphanumerics, uppercased."""
+        raw = re.sub(r'[^A-Za-z0-9]', '', str(meta.get('asin') or '')).upper()
+        return raw if len(raw) == 10 else None
+
     async def upload(self, meta):
         common = COMMON(config=self.config)
         await common.edit_torrent(meta, self.tracker, self.source_flag)
         cat_id = await self.get_cat_id(meta['category'], meta)
         type_id = await self.get_type_id(meta['type'])
-        resolution_id = await self.get_res_id(meta['resolution'])
+        non_video = self.is_non_video(meta)
+
+        # The API takes resolution_id as nullable outside movie/tv categories,
+        # and it does NOT coerce it by category the way it coerces the id
+        # fields. Sending the fallback would file every book under "Other",
+        # which then answers a resolution filter it has no business in.
+        resolution_id = None if non_video else await self.get_res_id(meta['resolution'])
+
         await common.unit3d_edit_desc(meta, self.tracker)
         region_id = await common.unit3d_region_ids(meta.get('region'))
         distributor_id = await common.unit3d_distributor_ids(meta.get('distributor'))
@@ -75,7 +136,12 @@ class NOBS():
         else:
             anon = 0
 
-        if meta['bdinfo'] != None:
+        # A book has no mediainfo and a ROM has no disc summary, and the book
+        # branch of prep never reaches the code that writes either file. Reading
+        # them unconditionally is what killed the upload before it ever posted.
+        if non_video:
+            mi_dump = bd_dump = None
+        elif meta.get('bdinfo') is not None:
             mi_dump = None
             bd_dump = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/BD_SUMMARY_00.txt", 'r', encoding='utf-8').read()
         else:
@@ -89,6 +155,8 @@ class NOBS():
             open_nfo = open(nfo_file, 'rb') 
             files['nfo'] = open_nfo
         manual_name = meta.get('manual_name')
+        # Every field below used to be meta['...'], which is fine on the video
+        # path where prep fills them all and fatal everywhere else.
         data = {
             'name' : manual_name or self.nobs_name(meta),
             'description' : desc,
@@ -97,15 +165,21 @@ class NOBS():
             'category_id' : cat_id,
             'type_id' : type_id,
             'resolution_id' : resolution_id,
-            'tmdb' : meta['tmdb'],
-            'imdb' : meta['imdb_id'].replace('tt', ''),
-            'tvdb' : None if meta.get('anime') else meta['tvdb_id'],
-            'mal' : meta['mal_id'],
-            'igdb' : 0,
+            'tmdb' : meta.get('tmdb') or 0,
+            'imdb' : str(meta.get('imdb_id') or '').replace('tt', ''),
+            'tvdb' : None if meta.get('anime') else (meta.get('tvdb') or meta.get('tvdb_id')),
+            'mal' : meta.get('mal_id') or 0,
+            # The tracker keys a game on IGDB, a book on its ISBN-13 and an
+            # audiobook on its Audible ASIN, and it fills the header card from
+            # whichever one arrives. It nulls the ids that do not belong to the
+            # category, so an id sent to the wrong one is dropped, not rejected.
+            'igdb' : int(meta.get('igdb') or 0),
+            'isbn13' : self._isbn13(meta),
+            'asin' : self._asin(meta),
             'anonymous' : anon,
-            'stream' : meta['stream'],
-            'sd' : meta['sd'],
-            'keywords' : meta['keywords'],
+            'stream' : meta.get('stream', 0),
+            'sd' : meta.get('sd', 0),
+            'keywords' : meta.get('keywords', ''),
             'personal_release' : int(meta.get('personalrelease', False)),
             'internal' : 0,
             'featured' : 0,
@@ -115,7 +189,7 @@ class NOBS():
         }
         # Internal
         if self.config['TRACKERS'][self.tracker].get('internal', False):
-            if meta['tag'] != "" and (meta['tag'][1:] in self.config['TRACKERS'][self.tracker].get('internal_groups', [])):
+            if meta.get('tag') and (meta['tag'][1:] in self.config['TRACKERS'][self.tracker].get('internal_groups', [])):
                 data['internal'] = 1
                 
         if region_id != 0:
@@ -232,12 +306,27 @@ class NOBS():
         console.print(f"[yellow]Searching for existing torrents on {self.tracker}...")
         params = {
             'api_token' : self.config['TRACKERS'][self.tracker]['api_key'].strip(),
-            'tmdbId' : meta['tmdb'],
             'categories[]' : await self.get_cat_id(meta['category'], meta),
             'types[]' : await self.get_type_id(meta['type']),
-            'resolutions[]' : await self.get_res_id(meta['resolution']),
             'name' : ""
         }
+
+        if self.is_non_video(meta):
+            # No tmdbId and no resolution to filter on -- and meta['tmdb'] does
+            # not even exist on the book path, so reading it raised before the
+            # request was ever made.
+            #
+            # The sharp filter would be the edition id, because two uploads of
+            # one ISBN really are the same edition. The filter API does not
+            # take one: TorrentSearchFiltersDTO accepts tmdbId/imdbId/tvdbId/
+            # malId and nothing for isbn13, asin or igdb. Unknown params are
+            # dropped silently, so asking would quietly match the whole
+            # category. Title it is, until the tracker grows the filter.
+            params['name'] = meta.get('title') or meta.get('name') or ""
+        else:
+            params['tmdbId'] = meta['tmdb']
+            params['resolutions[]'] = await self.get_res_id(meta['resolution'])
+
         if meta.get('edition', "") != "":
             params['name'] = params['name'] + f" {meta['edition']}"
         

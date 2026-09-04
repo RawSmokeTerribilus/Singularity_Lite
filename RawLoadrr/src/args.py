@@ -34,7 +34,7 @@ class Args():
         parser.add_argument('-in', '--input', dest='cli_path', nargs='*', help=argparse.SUPPRESS) # Alias for path
         parser.add_argument('-fd', '--full-directory', dest='full_dir', action='store_true', required=False, help="Uploads Folder + ALL Content Within")
         parser.add_argument('-s', '--screens', type=int, required=False, help="Number of screenshots", default=int(self.config['DEFAULT']['screens']))
-        parser.add_argument('-c', '--category', nargs='*', required=False, help="Category [MOVIE, TV, FANRES]", choices=['movie', 'tv', 'fanres'])
+        parser.add_argument('-c', '--category', nargs='*', required=False, help="Category [MOVIE, TV, FANRES, BOOK, AUDIOBOOK, GAME]", choices=['movie', 'tv', 'fanres', 'book', 'audiobook', 'game'])
         parser.add_argument('-t', '--type', nargs='*', required=False, help="Type [DISC, REMUX, ENCODE, WEBDL, WEBRIP, HDTV]", choices=['disc', 'remux', 'encode', 'webdl', 'web-dl', 'webrip', 'hdtv'])
         parser.add_argument('--source', nargs='*', required=False, help="Source [Blu-ray, BluRay, DVD, HDDVD, WEB, HDTV, UHDTV]", choices=['Blu-ray', 'BluRay', 'DVD', 'HDDVD', 'WEB', 'HDTV', 'UHDTV'], dest="manual_source")
         parser.add_argument('-format' '--format', nargs='*', required=False, help="Audio Source [WEB, CD, VINYL]")
@@ -42,6 +42,24 @@ class Args():
         parser.add_argument('-tmdb', '--tmdb', nargs='*', required=False, help="TMDb ID", type=str, dest='tmdb_manual')
         parser.add_argument('-imdb', '--imdb', nargs='*', required=False, help="IMDb ID", type=str)
         parser.add_argument('-mal', '--mal', nargs='*', required=False, help="MAL ID", type=str)
+        # Output only, never a lookup provider: TVDB v4 is paid with a per-user
+        # PIN, which is exactly why id_resolver excludes it. This flag exists so
+        # a tracker that asks for a TVDB id can be given one by hand.
+        parser.add_argument('-tvdb', '--tvdb', nargs='*', required=False, help="TVDB ID (passed through to the tracker; never queried)", type=str)
+        parser.add_argument('-isbn', '--isbn', nargs='*', required=False, help="ISBN of the e-book edition (10 or 13 digits; converted to ISBN-13)", type=str)
+        parser.add_argument('-asin', '--asin', nargs='*', required=False, help="Audible ASIN of the audiobook recording", type=str)
+        parser.add_argument('-igdb', '--igdb', nargs='*', required=False, help="IGDB game ID", type=str)
+        # Sin id determinante no se sube. Esto es la salida de emergencia, y
+        # tiene que costar teclearla: es lo único que separa una biblioteca de
+        # una carpeta de descargas subida entera por error.
+        parser.add_argument('--allow-no-id', dest='allow_no_id', action='store_true', required=False,
+                            help="Subir libros/audiolibros/juegos aunque ningún proveedor los reconozca")
+        # Acota QUÉ se busca al barrer un árbol. Sin esto, apuntar a una
+        # carpeta heterogénea encola todo lo que pilla, que es justo el
+        # accidente que nadie quiere.
+        parser.add_argument('--only', nargs='*', required=False, dest='only',
+                            choices=['video', 'book', 'audiobook', 'game', 'all'],
+                            help="Qué tipos buscar al barrer: video, book, audiobook, game, all")
         parser.add_argument('-mbid', '--mbid', nargs='?', help="MusicBrainz Release ID", type=self.validate_mbid, dest='mbid_manual')
         parser.add_argument('-discogs', '--discogs', nargs='*', required=False, help="Discogs Release ID", type=str, dest='discogs_id')
         parser.add_argument('-g', '--tag', nargs='*', required=False, help="Group Tag", type=str)

@@ -1532,7 +1532,7 @@ class TrackerIndex:
         # llamada a /api/torrents/filter?perPage=200, persistido entre sesiones.
         # Reemplaza el viejo hardcode `cat_id == "1" / "0"` que sólo funcionaba
         # contra el layout de categorías por defecto de UNIT3D y rompía cuando
-        # el admin reordenaba o añadía categorías (Retro Arcade, Anime, etc).
+        # el admin reordenaba o añadía categorías (Arcade, Anime, E-Books, etc).
         self.categories: dict = {}
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -1541,7 +1541,8 @@ class TrackerIndex:
     #
     # Cada UNIT3D puede definir sus propias categorías y reordenarlas a gusto.
     # El layout por defecto pone Movies=1 / TV=2 pero NOBS, por ejemplo, lleva:
-    #   1 Movies | 2 TV | 3 Retro Arcade | 4 Anime Movies | 5 Anime TV Shows
+    #   1 Movies | 2 TV | 3 Arcade | 4 Anime Movies | 5 Anime TV Shows
+    #   7 E-Books | 8 Audiobooks
     # Y se prevé que esa lista siga creciendo. Hardcodear los ids o trustear
     # "1=TV" rompe cada vez que un admin reorganiza. Solución: pedir una
     # muestra al endpoint público de filtro (1 llamada) y derivar la tabla
@@ -1674,7 +1675,7 @@ class TrackerIndex:
         #   2. Fallback regex sobre el nombre (S01E02 / Season N / E01)
         # El antiguo hardcode `cat_id == "1"` / `== "0"` ha desaparecido porque
         # rompía contra trackers que reordenan categorías (NOBS: 1=Movies,
-        # 2=TV, 3=Retro Arcade, 4=Anime Movies, 5=Anime TV Shows). El bug
+        # 2=TV, 3=Arcade, 4=Anime Movies, 5=Anime TV Shows). El bug
         # producía falsos NO_SUBIDO en cualquier torrent con cat_id≠"0"/"1":
         # caía al else y el regex fallaba en nombres "A Brief History 2024
         # S01E01E02..." porque `\bE\d{2,}\b` exige límite de palabra antes,

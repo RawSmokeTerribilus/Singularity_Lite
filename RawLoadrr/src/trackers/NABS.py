@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import re
 import requests
 import json
 import os
@@ -22,13 +23,44 @@ class NABS():
         self.logger = get_logger(self.tracker)
         pass
     
+    # Ids de STAGING, leídos de su propia base el 2026-08-22. NO coinciden con
+    # los de producción y no tienen por qué: cada instancia numera por su
+    # cuenta. Prod tiene E-Books=7 y Audiobooks=8; aquí son 10 y 11.
+    CATEGORY_IDS = {
+        'MOVIE': '1', 'TV': '2', 'GAME': '3',
+        'ANIME_MOVIE': '7', 'ANIME_TV': '8',
+        'BOOK': '10', 'AUDIOBOOK': '11',
+    }
+
     async def get_cat_id(self, category_name, meta=None):
         is_anime = bool(meta and (meta.get('anime') or int(meta.get('mal_id') or 0) != 0))
         if category_name == 'MOVIE':
-            return '7' if is_anime else '1'
+            return self.CATEGORY_IDS['ANIME_MOVIE'] if is_anime else self.CATEGORY_IDS['MOVIE']
         elif category_name == 'TV':
-            return '8' if is_anime else '2'
-        return '0'
+            return self.CATEGORY_IDS['ANIME_TV'] if is_anime else self.CATEGORY_IDS['TV']
+        return self.CATEGORY_IDS.get(category_name, '0')
+
+    def is_non_video(self, meta):
+        """Un libro, un audiolibro o un juego: sin disco, sin resolución, sin mediainfo."""
+        return (meta.get('category') in ('BOOK', 'AUDIOBOOK', 'GAME')
+                or meta.get('is_book') or meta.get('is_audiobook')
+                or meta.get('is_game'))
+
+    @staticmethod
+    def _isbn13(meta):
+        """13 dígitos; `isbn13_obra` es el del libro en una lectura libre."""
+        for clave in ('isbn13', 'isbn', 'isbn13_obra'):
+            raw = re.sub(r'[^0-9]', '', str(meta.get(clave) or ''))
+            if len(raw) == 13:
+                return raw
+
+        return None
+
+    @staticmethod
+    def _asin(meta):
+        """Los ASIN de Audible son exactamente 10 alfanuméricos, en mayúsculas."""
+        raw = re.sub(r'[^A-Za-z0-9]', '', str(meta.get('asin') or '')).upper()
+        return raw if len(raw) == 10 else None
 
     async def get_type_id(self, type):
         type_id = {
@@ -37,7 +69,18 @@ class NABS():
             'WEBDL': '4', 
             'WEBRIP': '5', 
             'HDTV': '6',
-            'ENCODE': '3'
+            'ENCODE': '3',
+            # Tipos de STAGING. Los de prod son otros (EPUB 7 allí, 10 aquí).
+            'EPUB': '10',
+            'PDF': '11',
+            'MOBI': '12',
+            'AZW3': '13',
+            'CBZ/CBR': '14',
+            'M4B': '15',
+            'MP3': '16',
+            'SCUMMVM': '17',
+            'ROM': '18',
+            'PC': '19',
             }.get(type, '0')
         return type_id
 
@@ -66,7 +109,12 @@ class NABS():
         await common.edit_torrent(meta, self.tracker, self.source_flag)
         cat_id = await self.get_cat_id(meta['category'], meta)
         type_id = await self.get_type_id(meta['type'])
-        resolution_id = await self.get_res_id(meta['resolution'])
+        non_video = self.is_non_video(meta)
+
+        # La API admite resolution_id nulo fuera de las categorías de vídeo, y
+        # NO lo corrige por categoría: mandar el fallback archivaría cada libro
+        # bajo "Other" y saldría en un filtro de resolución que no le toca.
+        resolution_id = None if non_video else await self.get_res_id(meta['resolution'])
         await common.unit3d_edit_desc(meta, self.tracker)
         region_id = await common.unit3d_region_ids(meta.get('region'))
         distributor_id = await common.unit3d_distributor_ids(meta.get('distributor'))
@@ -75,7 +123,12 @@ class NABS():
         else:
             anon = 0
 
-        if meta['bdinfo'] != None:
+        # Un libro no tiene mediainfo y una ROM no tiene resumen de disco, y la
+        # rama de libro de prep no llega al código que escribe ninguno de los
+        # dos ficheros. Leerlos sin mirar es lo que mataba la subida.
+        if non_video:
+            mi_dump = bd_dump = None
+        elif meta.get('bdinfo') is not None:
             mi_dump = None
             bd_dump = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/BD_SUMMARY_00.txt", 'r', encoding='utf-8').read()
         else:
@@ -97,15 +150,19 @@ class NABS():
             'category_id' : cat_id,
             'type_id' : type_id,
             'resolution_id' : resolution_id,
-            'tmdb' : meta['tmdb'],
-            'imdb' : meta['imdb_id'].replace('tt', ''),
-            'tvdb' : None if meta.get('anime') else meta['tvdb_id'],
-            'mal' : meta['mal_id'],
-            'igdb' : 0,
+            'tmdb' : meta.get('tmdb') or 0,
+            'imdb' : str(meta.get('imdb_id') or '').replace('tt', ''),
+            'tvdb' : None if meta.get('anime') else (meta.get('tvdb') or meta.get('tvdb_id')),
+            'mal' : meta.get('mal_id') or 0,
+            # El tracker anula por categoría los ids que no le tocan, así que
+            # un id enviado a la categoría equivocada se descarta, no revienta.
+            'igdb' : int(meta.get('igdb') or 0),
+            'isbn13' : self._isbn13(meta),
+            'asin' : self._asin(meta),
             'anonymous' : anon,
-            'stream' : meta['stream'],
-            'sd' : meta['sd'],
-            'keywords' : meta['keywords'],
+            'stream' : meta.get('stream', 0),
+            'sd' : meta.get('sd', 0),
+            'keywords' : meta.get('keywords', ''),
             'personal_release' : int(meta.get('personalrelease', False)),
             'internal' : 0,
             'featured' : 0,
@@ -232,12 +289,24 @@ class NABS():
         console.print(f"[yellow]Searching for existing torrents on {self.tracker}...")
         params = {
             'api_token' : self.config['TRACKERS'][self.tracker]['api_key'].strip(),
-            'tmdbId' : meta['tmdb'],
             'categories[]' : await self.get_cat_id(meta['category'], meta),
             'types[]' : await self.get_type_id(meta['type']),
-            'resolutions[]' : await self.get_res_id(meta['resolution']),
             'name' : ""
         }
+
+        if self.is_non_video(meta):
+            # Ni tmdbId ni resolución que filtrar aquí -- y meta['tmdb'] ni
+            # siquiera existe en la rama de libro, así que leerlo reventaba
+            # antes de hacer la petición.
+            #
+            # El filtro fino sería el id de edición, pero la filter API no lo
+            # acepta: toma tmdbId/imdbId/tvdbId/malId y nada para isbn13, asin
+            # ni igdb. Los parámetros desconocidos se tiran en silencio, así
+            # que preguntarlo casaría con la categoría entera. Por título.
+            params['name'] = meta.get('title') or meta.get('name') or ""
+        else:
+            params['tmdbId'] = meta['tmdb']
+            params['resolutions[]'] = await self.get_res_id(meta['resolution'])
         if meta.get('edition', "") != "":
             params['name'] = params['name'] + f" {meta['edition']}"
         

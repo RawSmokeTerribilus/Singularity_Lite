@@ -29,6 +29,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from core.status_manager import update_status
 from src.console import console
+from src.placeholders import es_placeholder
 from rich.prompt import Prompt, Confirm
 from rich.panel import Panel
 from rich.table import Table
@@ -72,34 +73,80 @@ class Rawncher:
             console.print("[bold yellow]⚠️  Asegúrate de que 'data/config.py' existe y es válido.[/bold yellow]")
         else:
             # Comprobamos APIs globales (TMDB/IMGBB) que son críticas para upload.py
+            # Cada entrada: campo en config.py -> (nombre visible, pista de dónde sale).
+            # Las tres últimas son las que necesitan libros y juegos, y faltaban:
+            # una instalación anterior a ellas no tiene el campo en su config.py
+            # —que es un fichero del usuario y NO se regenera— así que nunca se
+            # le preguntaba y el resolver le respondía "faltan las claves" sin
+            # decirle dónde ponerlas.
             master_keys = {
-                "tmdb_api": "TMDB_API_KEY",
-                "imdb_api": "IMDB_API_KEY",
-                "imgbb_api": "IMGBB_API_KEY",
-                "ptscreens_api": "PTSCREENS_API_KEY",
-                "ptpimg_api": "PTPIMG_API_KEY",
-                "lensdump_api": "LENSDUMP_API_KEY",
-                "oeimg_api": "OEIMG_API_KEY",
+                "tmdb_api":           ("TMDB_API_KEY", "themoviedb.org/settings/api"),
+                "imdb_api":           ("IMDB_API_KEY", ""),
+                "imgbb_api":          ("IMGBB_API_KEY", ""),
+                "ptscreens_api":      ("PTSCREENS_API_KEY", ""),
+                "ptpimg_api":         ("PTPIMG_API_KEY", ""),
+                "lensdump_api":       ("LENSDUMP_API_KEY", ""),
+                "oeimg_api":          ("OEIMG_API_KEY", ""),
+                "google_books_api":   ("GOOGLE_BOOKS_API", "console.cloud.google.com — identifica e-books y audiolibros"),
+                "igdb_client_id":     ("TWITCH_CLIENT_ID", "dev.twitch.tv/console — IGDB va detrás de una app de Twitch"),
+                "igdb_client_secret": ("TWITCH_CLIENT_SECRET", "la misma app de Twitch que el id"),
             }
             needs_save = False
             default_config = self.config.get("DEFAULT", {})
-            for python_key, env_key in master_keys.items():
+            for python_key, (env_key, pista) in master_keys.items():
                 val = default_config.get(python_key, "")
-                
-                # Heurística mejorada para detectar cualquier placeholder (YOUR_...) o vacío
-                if not val or val.startswith("YOUR_") or val in ["tu_clave_tmdb_aqui", "CAMBIAME"]:
+
+                # El hueco se reconoce en src/placeholders.py, no aquí: había
+                # tres formatos distintos y la comprobación de antes sólo veía
+                # el prefijo YOUR_.
+                if es_placeholder(val, env_key, python_key):
+                    obligatoria = python_key == "tmdb_api"
+
                     console.print(f"\n[bold red]✖ {env_key} no configurada o tiene valor por defecto.[/bold red]")
-                    # Permitir saltar las opcionales (hosts de imágenes extra)
-                    msg = f"[bold cyan]▶ Introduce el valor para {env_key}[/bold cyan]" + ("[dim] (Enter para saltar)[/dim]" if "tmdb" not in python_key else "")
+
+                    if pista:
+                        console.print(f"[dim]  {pista}[/dim]")
+
+                    msg = f"[bold cyan]▶ Introduce el valor para {env_key}[/bold cyan]"
+
+                    if not obligatoria:
+                        msg += "[dim] (Enter para dejarla vacía; no se vuelve a preguntar)[/dim]"
+
                     new_val = Prompt.ask(msg)
-                    
+
+                    if "DEFAULT" not in self.config:
+                        self.config["DEFAULT"] = {}
+
+                    # Se escribe clave a clave y en sitio. `_guardar_config()`
+                    # regeneraría config.py entero desde pformat() y se llevaría
+                    # por delante los comentarios del usuario --en el config de
+                    # producción hay 48 líneas de notas sobre la cascada de
+                    # hosts de imágenes que no están en ningún otro sitio.
                     if new_val.strip():
-                        if "DEFAULT" not in self.config:
-                            self.config["DEFAULT"] = {}
-                        self.config["DEFAULT"][python_key] = new_val.strip()
-                        needs_save = True
+                        if self._persistir_clave_default(python_key, new_val.strip()):
+                            needs_save = True
+                        else:
+                            # No se pudo escribir con garantías: el valor vale
+                            # para esta sesión, pero hay que decir que no queda.
+                            self.config["DEFAULT"][python_key] = new_val.strip()
+                            console.print(
+                                f"[bold yellow]  ⚠ No se pudo escribir en data/config.py. "
+                                f"Vale para esta sesión; ponla a mano en DEFAULT -> {python_key}.[/bold yellow]"
+                            )
+                    elif not obligatoria:
+                        # Saltar dejaba el campo AUSENTE, así que la aduana lo
+                        # volvía a preguntar en CADA arranque. Se persiste vacío:
+                        # el campo pasa a existir en config.py --visible y
+                        # editable a mano, que es lo que le faltaba a quien viene
+                        # de una versión anterior-- y deja de molestar. Es la
+                        # misma idea que ensure_env_keys() en Mass Edition.
+                        if self._persistir_clave_default(python_key, ""):
+                            needs_save = True
+                            console.print(
+                                f"[dim]  Se deja vacía. Para ponerla luego: "
+                                f"data/config.py -> DEFAULT -> {python_key}[/dim]"
+                            )
             if needs_save:
-                self._guardar_config()
                 console.print("[bold green]✅ Claves de API globales guardadas.[/]")
                 self._reload_config()  # Recargamos para que todo esté fresco
 
@@ -119,7 +166,7 @@ class Rawncher:
             host = Prompt.ask("URL del Cliente", default=qbit_data.get('qbit_url', 'http://172.17.0.1'))
             port = Prompt.ask("Puerto", default=str(qbit_data.get('qbit_port', '8888')))
             user = Prompt.ask("Usuario qBit", default=qbit_data.get('qbit_user', '').replace('YOUR_USERNAME', ''))
-            pwd  = Prompt.ask("Password qBit", password=True)
+            pwd  = Prompt.ask("Contraseña qBit", password=True)
 
             if "qbit" not in self.config: self.config["qbit"] = {}
             self.config["qbit"].update({
@@ -283,7 +330,7 @@ class Rawncher:
             "            RawLoadrr Launcher  ·  Industrial Grade  ·  CvT\n"
         )
         console.print(f"[bold cyan]{ascii_art}[/]")
-        console.print(Rule("[bold magenta]◈  RAWNCHER SESSION INICIADA[/bold magenta]", style="magenta"))
+        console.print(Rule("[bold magenta]◈  RAWNCHER SESIÓN INICIADA[/bold magenta]", style="magenta"))
         while True:
             try:
                 choice = self._menu_principal()
@@ -480,7 +527,7 @@ class Rawncher:
                 "\n"
                 "  [bold cyan][1][/bold cyan]  Subir desde una ruta (archivo o carpeta)\n"
                 "  [bold cyan][2][/bold cyan]  Usar lista existente (.txt con rutas)\n"
-                "  [bold cyan][3][/bold cyan]  Triage primero (escanear directorio y elegir listas)\n",
+                "  [bold cyan][3][/bold cyan]  Triaje primero (escanear directorio y elegir listas)\n",
                 title=f"[bold green]◈  Tracker: {tracker}[/bold green]",
                 border_style="green",
             )
@@ -497,20 +544,79 @@ class Rawncher:
         elif sub == "3":
             self._flujo_triage(tracker)
 
+    def _elegir_tipos(self, ruta, hallado) -> list:
+        """
+        Acota QUÉ se busca en el árbol, y devuelve los flags `--only`.
+
+        Sólo pregunta cuando hay MEZCLA: un directorio de un solo tipo no es
+        ambiguo y hacer clicar por gusto sobra. La pregunta existe por un
+        accidente concreto -- apuntar esto a la carpeta de descargas -- donde
+        encolar todo junto es como se sube una factura a un tracker público.
+        """
+        if len(hallado) <= 1:
+            return []
+
+        console.print()
+        table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            border_style="dim",
+            title="[bold yellow]Aquí hay de todo — ¿qué quieres subir?[/bold yellow]",
+        )
+        table.add_column("#", style="dim", justify="right")
+        table.add_column("Tipo")
+        table.add_column("Encontrados", justify="right")
+
+        from src.library import LABELS
+
+        for i, (kind, n) in enumerate(hallado, 1):
+            table.add_row(str(i), LABELS[kind], str(n))
+
+        table.add_row(str(len(hallado) + 1), "[dim]todo junto[/dim]",
+                      str(sum(n for _k, n in hallado)))
+        console.print(table)
+        console.print("[dim]Subir tipos distintos en la misma tirada casi nunca es lo "
+                      "que se quiere.[/dim]")
+
+        opciones = [str(i) for i in range(1, len(hallado) + 2)]
+        elegido = int(Prompt.ask("[bold]Opción[/bold]", choices=opciones, default="1"))
+
+        if elegido > len(hallado):
+            return ["--only", "all"]
+
+        return ["--only", hallado[elegido - 1][0]]
+
     def _args_opcionales(self, debug: bool = False) -> list:
         """Muestra lista de flags opcionales para upload.py y devuelve los seleccionados"""
         flags = [
-            ("--anon",            "Subida anónima"),
-            ("--skip-dupe-check", "Saltar comprobación de duplicados"),
-            ("--stream",          "Stream Optimized Upload"),
-            ("--personalrelease", "Personal Release"),
-            ("--no-seed",         "No añadir torrent al cliente"),
-            ("--debug",           "Modo debug (sin subida real)"),
+            ("--anon",            "Subida anónima",                    "bool"),
+            ("--skip-dupe-check", "Saltar comprobación de duplicados",  "bool"),
+            ("--stream",          "Stream Optimized Upload",            "bool"),
+            ("--personalrelease", "Personal Release",                   "bool"),
+            ("--no-seed",         "No añadir torrent al cliente",       "bool"),
+            ("--debug",           "Modo debug (sin subida real)",       "bool"),
+            # Los ids a mano cortocircuitan el resolver, que es la salida honesta
+            # cuando la identificación automática se equivoca. Hasta ahora había
+            # que salirse del lanzador y tirar upload.py a pelo para dar uno.
+            ("--tmdb",            "Id de TMDB (peli o serie)",          "valor"),
+            ("--imdb",            "Id de IMDB (ttNNNNNNN)",             "valor"),
+            ("--tvdb",            "Id de TVDB (sólo se envía)",         "valor"),
+            ("--mal",             "Id de MyAnimeList (anime)",          "valor"),
+            ("--isbn",            "ISBN del e-book (10 ó 13 dígitos)",  "valor"),
+            ("--asin",            "ASIN de Audible (audiolibro)",       "valor"),
+            ("--igdb",            "Id de IGDB (juego)",                 "valor"),
         ]
 
         selected = set()
         if debug:
             selected.add("--debug")
+
+        def _valor_de(flag):
+            """El valor ya elegido para un flag de valor, o cadena vacía."""
+            for entry in selected:
+                if entry.split(" ", 1)[0] == flag and " " in entry:
+                    return entry.split(" ", 1)[1]
+            return ""
 
         while True:
             console.print()
@@ -525,9 +631,12 @@ class Rawncher:
             table.add_column("Descripción")
             table.add_column("Estado", justify="center")
 
-            for i, (flag, desc) in enumerate(flags, 1):
+            for i, (flag, desc, kind) in enumerate(flags, 1):
                 is_debug_flag = flag == "--debug"
-                if is_debug_flag and debug:
+                if kind == "valor":
+                    valor = _valor_de(flag)
+                    estado = f"[green]{valor}[/green]" if valor else "[dim]✗[/dim]"
+                elif is_debug_flag and debug:
                     estado = "[green]✓ (bloqueado)[/green]"
                 elif flag in selected:
                     estado = "[green]✓[/green]"
@@ -549,7 +658,7 @@ class Rawncher:
             elif raw == "c":
                 cat = Prompt.ask(
                     "Categoría",
-                    choices=["movie", "tv", "fanres"],
+                    choices=["movie", "tv", "fanres", "book", "audiobook", "game"],
                     default="tv",
                 )
                 selected_cats = {f for f in selected if f.startswith("--category")}
@@ -575,9 +684,20 @@ class Rawncher:
                     console.print("[bold red]❌ Número fuera de rango.[/bold red]")
                     continue
 
-                flag, _ = flags[idx - 1]
+                flag, _, kind = flags[idx - 1]
                 if flag == "--debug" and debug:
                     console.print("[bold yellow]⚠️  El flag --debug está bloqueado en modo debug.[/bold yellow]")
+                    continue
+
+                if kind == "valor":
+                    # Dejarlo en blanco lo quita, que es la única forma de
+                    # deshacer un id tecleado mal sin salirse del menú.
+                    valor = Prompt.ask(f"Valor para {flag}",
+                                       default=_valor_de(flag)).strip()
+                    selected -= {e for e in selected
+                                 if e.split(" ", 1)[0] == flag}
+                    if valor:
+                        selected.add(f"{flag} {valor}")
                     continue
 
                 if flag in selected:
@@ -600,25 +720,44 @@ class Rawncher:
                 break
             console.print(f"[bold red]❌ No existe: {ruta_raw}[/bold red]")
 
+        # Este bloque sólo sabía de MKV y avisaba de "directorio sin archivos
+        # MKV" ante 77 juegos de ScummVM perfectamente subibles.
+        #
+        # El conteo lo hace `library`, no este fichero: es el mismo que usa la
+        # cola de subida, así que lo que aquí se anuncia y lo que allí se
+        # encola no pueden discrepar. Contar por nuestra cuenta ya dio un
+        # falso positivo -- una carpeta de películas con un caratulas.zip
+        # salía como "1 de vídeo, 1 de juego".
+        from src import library as _lib
+
         if ruta.is_file():
-            if ruta.suffix.lower() == ".mkv":
-                console.print(f"[bold green]✅ Archivo MKV detectado:[/bold green] {ruta.name}")
+            kind = _lib.classify(ruta.name)
+            hallado = [(kind, 1)] if kind else []
+            if hallado:
+                console.print(f"[bold green]✅ {_lib.LABELS[kind].capitalize()} detectado:"
+                              f"[/bold green] {ruta.name}")
             else:
-                console.print(f"[bold yellow]⚠️  Archivo no-MKV — se procesará de todas formas.[/bold yellow]")
-        elif ruta.is_dir():
-            mkv_files = list(ruta.rglob("*.mkv"))
-            if mkv_files:
-                console.print(
-                    f"[bold green]✅ Directorio con {len(mkv_files)} archivo(s) MKV.[/bold green]"
-                )
+                console.print(f"[bold yellow]⚠️  Extensión no reconocida "
+                              f"({ruta.suffix or 'sin extensión'}) — se intentará "
+                              f"de todas formas.[/bold yellow]")
+        else:
+            encontrado = _lib.scan(str(ruta))
+            hallado = _lib.counts(encontrado)
+            if hallado:
+                console.print(f"[bold green]✅ Directorio con "
+                              f"{_lib.describe(encontrado)}.[/bold green]")
             else:
                 console.print(
-                    "[bold yellow]⚠️  Directorio sin archivos MKV — se procesará de todas formas.[/bold yellow]"
+                    "[bold yellow]⚠️  Directorio sin nada que RawLoadrr sepa subir "
+                    "(vídeo, e-books, audiolibros ni juegos) — se intentará de "
+                    "todas formas.[/bold yellow]"
                 )
+
+        only = self._elegir_tipos(ruta, hallado)
 
         flags = self._args_opcionales(debug=debug)
 
-        cmd = ["python3", "upload.py", "--tracker", tracker, "--input", str(ruta)] + flags
+        cmd = ["python3", "upload.py", "--tracker", tracker, "--input", str(ruta)] + only + flags
 
         # LÓGICA DE CONTINGENCIA: Si el cliente está caído, no intentes añadir el torrent.
         # El .torrent generado se quedará en su carpeta tmp/<uuid>/
@@ -777,7 +916,7 @@ class Rawncher:
         tmp_list.parent.mkdir(parents=True, exist_ok=True)
         tmp_list.write_text("\n".join(resolved) + "\n", encoding="utf-8")
         console.print()
-        console.print(Rule(f"[bold yellow]▸  Re-subiendo {len(resolved)} "
+        console.print(Rule(f"[bold yellow]▸  Resubiendo {len(resolved)} "
                             f"release(s) resuelto(s)[/bold yellow]",
                             style="yellow"))
         cmd = ["python3", "auto-upload.py", "--list", str(tmp_list),
@@ -794,22 +933,22 @@ class Rawncher:
     def _flujo_triage(self, tracker: str) -> None:
         """Sub-flujo: ejecutar triage_mkv.py y luego subir las listas generadas"""
         while True:
-            ruta_raw = Prompt.ask("[bold]Directorio a analizar con triage[/bold]").strip()
+            ruta_raw = Prompt.ask("[bold]Directorio a analizar con el triaje[/bold]").strip()
             ruta = Path(ruta_raw)
             if ruta.is_dir():
                 break
             console.print(f"[bold red]❌ No es un directorio válido: {ruta_raw}[/bold red]")
 
         console.print()
-        console.print(Rule("[bold cyan]▸  RECON — Ejecutando Triage[/bold cyan]", style="cyan"))
-        console.print(f"\n[bold cyan]▶ Ejecutando triage en:[/bold cyan] {ruta}")
+        console.print(Rule("[bold cyan]▸  RECON — Ejecutando Triaje[/bold cyan]", style="cyan"))
+        console.print(f"\n[bold cyan]▶ Ejecutando el triaje en:[/bold cyan] {ruta}")
         self._ejecutar_comando(["python3", "../extras/Triaje-mkv/triage_mkv.py", str(ruta)])
 
         hevc_files = sorted(self.base_dir.glob("todo-hevc-*.txt"))
         h264_files = sorted(self.base_dir.glob("sigue-h264-*.txt"))
 
         if not hevc_files and not h264_files:
-            console.print("[bold yellow]⚠️  No se encontraron listas generadas por triage.[/bold yellow]")
+            console.print("[bold yellow]⚠️  No se encontraron listas generadas por el triaje.[/bold yellow]")
             return
 
         console.print()
@@ -899,6 +1038,119 @@ class Rawncher:
         except Exception as e:
             console.print(f"[bold red]❌ Error al leer config.py: {e}[/bold red]")
             return None
+
+    def _persistir_clave_default(self, campo: str, valor: str) -> bool:
+        """Escribe UNA clave de DEFAULT en config.py sin reconstruir el fichero.
+
+        Por qué no vale `_guardar_config()` aquí: ese método regenera config.py
+        entero desde `pformat(self.config)`, y eso **borra todos los
+        comentarios**. En el config.py de producción hay 48 líneas de notas
+        escritas a mano sobre la cascada de hosts de imágenes —por qué imgbox y
+        pixhost están fuera, qué devolvió cada host en la última prueba en
+        vivo— que no viven en ningún otro sitio. Perderlas por rellenar una
+        clave no compensa.
+
+        Es la misma idea que `ensure_env_keys()` en Mass Edition: añadir sólo
+        lo que falta y no tocar nada más.
+
+        Devuelve True si lo escribió. Si no puede hacerlo con garantías
+        devuelve False sin tocar el fichero, y el llamante decide qué hacer;
+        nunca lo deja a medias.
+
+        Limitación conocida: un `'DEFAULT': {}` literalmente vacío y todo en
+        una línea no se puede ampliar por aquí. Falla en seguro --devuelve
+        False y no toca nada-- y no se ha cubierto porque config.py.example
+        trae cuarenta claves, así que esa forma no se da en la práctica.
+        """
+        ruta = self.base_dir / "data" / "config.py"
+
+        try:
+            original = ruta.read_text(encoding="utf-8")
+        except OSError as e:
+            self._logger.error(f"No se pudo leer config.py: {e}")
+            return False
+
+        literal = repr(str(valor))
+        lineas = original.splitlines(keepends=True)
+        nuevo = None
+
+        # 1) El campo ya existe: se sustituye SÓLO su línea, conservando sangría
+        #    y la coma final. Se exige que la línea termine en coma para no
+        #    comerse un cierre de llave que compartiera línea.
+        patron_campo = re.compile(r"^(\s*)['\"]" + re.escape(campo) + r"['\"]\s*:\s*.*,\s*$")
+
+        for i, linea in enumerate(lineas):
+            m = patron_campo.match(linea)
+
+            if m:
+                copia = list(lineas)
+                copia[i] = f"{m.group(1)}'{campo}': {literal},\n"
+                nuevo = "".join(copia)
+                break
+
+        # 2) No existe: se inserta justo después de la apertura de DEFAULT. La
+        #    sangría dentro de un literal es libre, así que basta con una línea
+        #    propia; la verificación de abajo confirma que quedó bien.
+        if nuevo is None:
+            # `search`, no `match`: pformat deja la apertura pegada a lo
+            # anterior ("config = {'AUTO': {...}, 'DEFAULT': {'add_logo': ...")
+            # y anclar al principio de línea no la encontraba.
+            patron_default = re.compile(r"['\"]DEFAULT['\"]\s*:\s*\{")
+            patron_hermano = re.compile(r"^(\s*)['\"][A-Za-z_][\w]*['\"]\s*:")
+
+            for i, linea in enumerate(lineas):
+                if not patron_default.search(linea):
+                    continue
+
+                # La sangría se copia de la clave hermana de debajo, no se
+                # calcula: pformat alinea con la llave y una sangría inventada
+                # queda torcida aunque sea válida.
+                sangria = None
+
+                if i + 1 < len(lineas):
+                    h = patron_hermano.match(lineas[i + 1])
+
+                    if h:
+                        sangria = h.group(1)
+
+                if sangria is None:
+                    sangria = " " * (len(linea) - len(linea.lstrip()) + 4)
+
+                copia = list(lineas)
+                copia.insert(i + 1, f"{sangria}'{campo}': {literal},\n")
+                nuevo = "".join(copia)
+                break
+
+        if nuevo is None:
+            self._logger.warning(f"No se encontró dónde escribir '{campo}' en config.py")
+            return False
+
+        # 3) Antes de escribir, se comprueba que el resultado sigue siendo un
+        #    config válido Y que la clave quedó con el valor pedido. Si algo no
+        #    cuadra, el fichero se queda como estaba.
+        try:
+            ns: dict = {}
+            exec(compile(nuevo, str(ruta), "exec"), ns)  # noqa: S102
+
+            if ns.get("config", {}).get("DEFAULT", {}).get(campo) != str(valor):
+                raise ValueError("la clave no quedó con el valor esperado")
+        except Exception as e:                                    # noqa: BLE001
+            self._logger.error(f"Edición de config.py descartada ({campo}): {e}")
+            return False
+
+        try:
+            # write_text trunca el fichero EN SITIO y conserva el inodo. Es
+            # obligatorio: config.py se monta como fichero suelto en el
+            # contenedor y sustituirlo (os.replace) rompería el bind-mount.
+            ruta.write_text(nuevo, encoding="utf-8")
+        except OSError as e:
+            self._logger.error(f"No se pudo escribir config.py: {e}")
+            return False
+
+        self.config.setdefault("DEFAULT", {})[campo] = str(valor)
+        importlib.invalidate_caches()
+
+        return True
 
     def _reload_config(self) -> None:
         """Recarga la configuración desde el archivo."""
@@ -1028,7 +1280,7 @@ class Rawncher:
                     f"[bold]API key para {tracker}[/bold] [dim](mín. 32 caracteres)[/dim]"
                 ).strip()
                 if len(nueva_key) < 32:
-                    console.print(f"[bold red]❌ Demasiado corta ({len(nueva_key)} chars). Mínimo 32.[/bold red]")
+                    console.print(f"[bold red]❌ Demasiado corta ({len(nueva_key)} caracteres). Mínimo 32.[/bold red]")
                     continue
                 if "API_KEY" in nueva_key:
                     console.print("[bold red]❌ El valor contiene 'API_KEY', introduce la clave real.[/bold red]")
@@ -1049,7 +1301,7 @@ class Rawncher:
                     console.print("[bold red]❌ Debe empezar por 'https://'.[/bold red]")
                     continue
                 if "Custom_Announce_URL" in nueva_url or "YOUR_PASSKEY" in nueva_url:
-                    console.print("[bold red]❌ El valor sigue siendo el placeholder, introduce la URL real.[/bold red]")
+                    console.print("[bold red]❌ El valor sigue siendo el de ejemplo, introduce la URL real.[/bold red]")
                     continue
                 break
             if self._escribir_config_tracker(tracker, "announce_url", nueva_url):
@@ -1100,8 +1352,8 @@ class Rawncher:
             curr_screens = default_cfg.get("screens", "4")
             curr_size = default_cfg.get("img_size", "500")
 
-            console.print(f"\n[cyan]Screens (Global):[/cyan] {curr_screens}")
-            console.print(f"[cyan]Img Size (Global):[/cyan] {curr_size}")
+            console.print(f"\n[cyan]Capturas (global):[/cyan] {curr_screens}")
+            console.print(f"[cyan]Tamaño de imagen (global):[/cyan] {curr_size}")
 
             if Confirm.ask("¿Editar valores?", default=False):
                 new_screens = Prompt.ask("Número de capturas", default=str(curr_screens))

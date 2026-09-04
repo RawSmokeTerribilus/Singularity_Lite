@@ -1,5 +1,11 @@
 """05_image_regenerator — regenera las capturas desde el medio original.
 
+Con --desde-cola toma la descripción ORIGINAL de la cola que dejó
+06_intruso al barrer, en vez de la página viva. Sirve cuando la limpieza
+de Intruso ya ha pasado: el spam se quita YA (no cuesta cuota de imágenes)
+y las galerías se regeneran después desde el medio local, que es el camino
+barato — sin descargar nada.
+
 Diferencia clave con 04_image_resurrector: 04 es un RE-SUBIDOR (lee PNGs que ya
 existen en la carpeta local de tmp y muere con "No hay imágenes locales" si la
 carpeta está vacía). Este módulo GENERA las capturas de cero a partir del
@@ -77,7 +83,9 @@ ENV_DEFAULTS = [
     ("ME_REGEN_SCREENS",    "",   "Nº de capturas. Vacío = tantas como haya que reponer"),
     ("ME_REGEN_KEEP_PNG",   "0",  "1 conserva los PNG en tmp; 0 los borra tras subirlos"),
     ("ME_REGEN_DRY_RUN",    "0",  "1 = simulacro. Los flags --real/--dry-run mandan sobre esto"),
-    ("ME_REGEN_IMG_SIZE",   "350","Ancho del [img=N] si la etiqueta original no traía uno"),
+    ("ME_REGEN_IMG_SIZE",   "600","Ancho del [img=N] de las capturas repuestas. Vacío = respetar el de la etiqueta vieja"),
+    ("ME_REGEN_IMG_SIZE_RESPETAR", "0",
+     "1 = conservar el ancho que ya tenía cada etiqueta y usar ME_REGEN_IMG_SIZE sólo cuando no traía ninguno"),
     ("ME_REGEN_STATE_DIR",  "",   "Dónde viven mapeo_qbit_*.json y completados_regen_*.txt"),
     ("ME_REGEN_ALL",        "0",  "1 = procesa todo el cliente e ignora ID_START/ID_END"),
     ("ME_REGEN_LIMIT",      "0",  "Tope de torrents por tirada. 0 = sin tope"),
@@ -88,6 +96,10 @@ ENV_DEFAULTS = [
     ("ME_REGEN_JPG_Q",       "3",  "Calidad del JPG para ffmpeg -q:v (2 mejor … 31 peor). 3 ≈ 7% del peso del PNG"),
     ("ME_REGEN_TONEMAP",     "1",  "1 = convierte HDR/PQ a SDR en las capturas. Sin esto salen lavadas y sepia"),
     ("ME_REGEN_TONEMAP_OP",  "mobius", "Operador de tonemap de ffmpeg: mobius (recomendado), reinhard, hable, clip"),
+    ("ME_INTRUSO_ESPERA_TRACKER",     "120",
+     "Segundos entre sondas cuando el tracker devuelve 5xx (backup de la BD)"),
+    ("ME_INTRUSO_ESPERA_TRACKER_MAX", "5400",
+     "Tope total de espera al tracker. El backup ronda 30 min y crece; 90 min da margen"),
 ]
 
 _CIERTO = {"1", "true", "yes", "y", "on", "si", "sí", "s", "t"}
@@ -163,12 +175,35 @@ if ensure_env_keys(_ENV_PATH):
     except ImportError:
         pass
 
-DEAD_HOSTS = [h.strip().lower()
-              for h in os.getenv("ME_DEAD_HOSTS", "imgbox.com").split(",")
-              if h.strip()]
+def _hosts_muertos():
+    """Qué hosts se consideran muertos EN ESTA TIRADA.
+
+    `--muertos a.com,b.net` manda sobre ME_DEAD_HOSTS. Tiene que ser bandera y
+    no variable de entorno por lo mismo que `--tracker`: config.py hace
+    load_dotenv(override=True), así que un `-e ME_DEAD_HOSTS=…` por delante del
+    comando se pierde. Y siendo global, dos tiradas simultáneas sobre trackers
+    distintos compartían valor: si cada tracker tiene su host caído, no había
+    forma de expresarlo.
+    """
+    args = sys.argv[1:]
+    crudo = None
+    for i, a in enumerate(args):
+        if a in ("--muertos", "--dead-hosts") and i + 1 < len(args):
+            crudo = args[i + 1]
+            break
+        if a.startswith(("--muertos=", "--dead-hosts=")):
+            crudo = a.split("=", 1)[1]
+            break
+    if crudo is None:
+        crudo = os.getenv("ME_DEAD_HOSTS", "imgbox.com")
+    return [h.strip().lower() for h in crudo.split(",") if h.strip()]
+
+
+DEAD_HOSTS = _hosts_muertos()
 REGEN_IMG_HOST  = os.getenv("ME_REGEN_IMG_HOST", "").strip().lower()
 REGEN_SCREENS   = os.getenv("ME_REGEN_SCREENS", "").strip()
-REGEN_IMG_SIZE  = os.getenv("ME_REGEN_IMG_SIZE", "350").strip()
+REGEN_IMG_SIZE  = os.getenv("ME_REGEN_IMG_SIZE", "600").strip().lstrip("=")
+REGEN_IMG_SIZE_RESPETAR = flag("ME_REGEN_IMG_SIZE_RESPETAR", "0")
 REGEN_STATE_DIR = os.getenv("ME_REGEN_STATE_DIR", "").strip() or "."
 REGEN_LIMIT     = int(os.getenv("ME_REGEN_LIMIT", "0") or 0)
 REGEN_KEEP_PNG  = flag("ME_REGEN_KEEP_PNG", "0")
@@ -484,6 +519,27 @@ def _elegir_img_host(rl_config):
     return "imgbb"
 
 
+def _cargar_cola_intruso():
+    """La cola que dejó Intruso al barrer, con las descripciones ORIGINALES.
+
+    Sirve para el caso en que la limpieza de Intruso ya haya pasado: la página
+    viva no tiene enlaces muertos, así que el criterio normal de 05 no encuentra
+    nada, pero el sitio donde iba la galería sigue guardado aquí. Permite limpiar
+    el spam YA (que no cuesta cuota) y regenerar después desde el medio local,
+    sin perder el camino barato.
+    """
+    ruta = os.path.join(REGEN_STATE_DIR, f"intruso_cola_{_SUF}.json")
+    datos = _cargar_json(ruta)
+    entradas = datos.get("entradas") or []
+    if not entradas:
+        return {}, ruta
+    return {str(e["id"]): e.get("descripcion_original", "") for e in entradas}, ruta
+
+
+DESDE_COLA = bool(_ARGS & {"--desde-cola", "--from-queue"})
+COLA_INTRUSO = {}
+
+
 def _es_url_muerta(url):
     u = (url or "").lower()
     return any(dead in u for dead in DEAD_HOSTS)
@@ -662,6 +718,7 @@ def _pngs(carpeta, prefijo=None):
     patron = f"{prefijo}-*.png" if prefijo else "*.png"
     return glob.glob(os.path.join(glob.escape(carpeta), patron))
 
+
 def _capturas(carpeta, prefijo=None):
     """PNG + JPG de la carpeta. Para limpiar hay que mirar las dos extensiones:
     desde que se recodifica a JPG antes de subir, borrar sólo los PNG dejaba el
@@ -806,9 +863,13 @@ def a_jpg(carpeta, nombres, calidad=None, tonemap=False):
             continue
         destino = os.path.splitext(origen)[0] + ".jpg"
         try:
-            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", origen,
+            # `-nostdin` y stdin cerrado: sin esto, un ffmpeg que muere por el
+            # `timeout=` deja el terminal en modo crudo y el lanzador parece
+            # colgado despues, esperando un Enter que nunca llega.
+            subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", origen,
                             *vf, "-q:v", q, destino],
-                           capture_output=True, text=True, timeout=180)
+                           capture_output=True, text=True, timeout=180,
+                           stdin=subprocess.DEVNULL)
         except Exception:
             pass
         if os.path.exists(destino) and os.path.getsize(destino) > 0:
@@ -822,9 +883,6 @@ def a_jpg(carpeta, nombres, calidad=None, tonemap=False):
         print(f"    🗜️  capturas a JPG q{q}: {antes/1048576:.1f} MiB → "
               f"{despues/1048576:.2f} MiB ({despues*100/antes:.0f}%)", flush=True)
     return salida
-
-
-
 
 
 def _duracion_segundos(carpeta):
@@ -924,7 +982,6 @@ def regenerar_imagenes(media_path, uuid, screens, img_host, rl_config, reanudar)
 
         # Sólo se suben las que se van a usar: subir el sobrante gastaría cuota
         # del host de imágenes para nada.
-
         elegidas = [os.path.basename(x) for x in disponibles[:screens]]
         # El tonemap se aplica al recodificar, no al capturar: prep.screenshots()
         # es de upstream y no acepta filtros, así que se reconvierte después.
@@ -967,8 +1024,8 @@ def regenerar_imagenes(media_path, uuid, screens, img_host, rl_config, reanudar)
 # ✂️ SUSTITUCIÓN QUIRÚRGICA EN LA DESCRIPCIÓN
 # ==========================================
 def _tag(img, size_attr):
-    """Mismo formato que COMMON.py:121, conservando el ancho que ya tenía la
-    etiqueta original ('=600', '' , …) para no alterar la maquetación.
+    """Mismo formato que COMMON.py:121. El ancho lo decide `_size_attr`:
+    ME_REGEN_IMG_SIZE si está puesto, y si no el que ya tenía la etiqueta.
 
     Las DOS urls apuntan a la imagen directa, no al visualizador del host.
     Antes el `[url=]` llevaba `web_url`, así que pinchar una captura sacaba al
@@ -985,9 +1042,30 @@ def _tag(img, size_attr):
 
 
 def _size_attr(match=None):
-    if match is not None:
-        return match.group("size") or ""
-    return f"={REGEN_IMG_SIZE}" if REGEN_IMG_SIZE else ""
+    """El ancho del [img=N] que se va a escribir.
+
+    ME_REGEN_IMG_SIZE MANDA cuando está puesto. Antes era sólo un respaldo para
+    cuando la etiqueta vieja no traía ancho, y eso hacía que la variable no
+    sirviera para nada en la práctica: medido sobre las 2.900 descripciones de
+    la cola de MILNU, de las 13.327 etiquetas muertas 9.756 traían "=500",
+    3.439 "=600", 118 "=350" y sólo DIEZ venían sin ancho. O sea que el 99,9%
+    de las veces se reponía con el ancho viejo y la configuración se ignoraba
+    en silencio. Ya había mordido antes en NOBS.
+
+    Quien quiera la maquetación original tiene ME_REGEN_IMG_SIZE_RESPETAR=1, y
+    dejar ME_REGEN_IMG_SIZE vacío sigue significando "no forzar nada".
+    """
+    forzado = f"={REGEN_IMG_SIZE}" if REGEN_IMG_SIZE else ""
+
+    if match is None:
+        return forzado
+
+    original = match.group("size") or ""
+
+    if forzado and not REGEN_IMG_SIZE_RESPETAR:
+        return forzado
+
+    return original or forzado
 
 
 def _texto_sin_imagenes(s):
@@ -1365,8 +1443,26 @@ def procesar(tid, media_root, session, site_base, rl_config, screens, img_host):
     if err:
         return False, err
 
+    base = desc_actual
+    origen = "la página"
+
     if not any(dead in desc_actual.lower() for dead in DEAD_HOSTS):
-        return True, "ya está limpio"
+        if not (DESDE_COLA and str(tid) in COLA_INTRUSO):
+            return True, "ya está limpio"
+
+        # La página ya la limpió Intruso: se reconstruye sobre el original
+        # guardado, que sí conserva dónde iba la galería.
+        base = COLA_INTRUSO[str(tid)]
+        origen = "la cola de Intruso"
+
+        if not any(dead in base.lower() for dead in DEAD_HOSTS):
+            return True, "ya está limpio (tampoco había nada en la cola)"
+
+        # Que nadie haya editado la página por medio: el texto que queda al
+        # quitar las imágenes tiene que ser el mismo en las dos versiones.
+        if _texto_sin_imagenes(base) != _texto_sin_imagenes(desc_actual):
+            return False, ("la página cambió desde el barrido de Intruso; "
+                           "no se reconstruye sobre el original")
 
     media_path = elegir_fichero(media_root)
     if not media_path:
@@ -1386,7 +1482,7 @@ def procesar(tid, media_root, session, site_base, rl_config, screens, img_host):
     # Tantas capturas como imágenes muertas haya: así la sustitución es 1 a 1 y
     # el documento no cambia en nada más. Aquí manda la descripción, no el
     # `screens` de RawLoadrr (que es el valor por defecto para subidas nuevas).
-    objetivo = contar_muertas(desc_actual) or 1
+    objetivo = contar_muertas(base) or 1
 
     image_list, err = regenerar_imagenes(
         media_path, uuid, objetivo, img_host, rl_config, reanudar
@@ -1394,7 +1490,7 @@ def procesar(tid, media_root, session, site_base, rl_config, screens, img_host):
     if err:
         return False, err
 
-    desc_nueva, n, err = sustituir_imagenes(desc_actual, image_list)
+    desc_nueva, n, err = sustituir_imagenes(base, image_list)
     if err:
         return False, err
 
@@ -1404,7 +1500,7 @@ def procesar(tid, media_root, session, site_base, rl_config, screens, img_host):
     # envía nada.
     if not desc_nueva.strip():
         return False, "la descripción resultante está vacía — abortado"
-    if _texto_sin_imagenes(desc_nueva) != _texto_sin_imagenes(desc_actual):
+    if _texto_sin_imagenes(desc_nueva) != _texto_sin_imagenes(base):
         return False, "el texto de fuera de las imágenes cambió — abortado"
 
     aviso = "" if len(image_list) == n else f"  ⚠️  {n} muertas pero sólo {len(image_list)} nuevas"
@@ -1450,7 +1546,8 @@ def procesar(tid, media_root, session, site_base, rl_config, screens, img_host):
             except OSError:
                 pass
 
-    return True, f"{n} etiqueta(s) → {len(image_list)} imagen(es) publicadas{aviso}"
+    return True, (f"{n} etiqueta(s) → {len(image_list)} imagen(es) publicadas"
+                  f"{'' if origen == 'la página' else ' [desde ' + origen + ']'}{aviso}")
 
 
 # ==========================================
@@ -1474,6 +1571,18 @@ def main():
     print(f"🖼️  Host    : {img_host}   (capturas: las que haga falta reponer en cada torrent)")
     print(f"⚙️  Modo    : {'SIMULACRO (no se escribe nada)' if DRY_RUN else 'REAL — se editará el tracker'}")
     print(f"☠️  Muertos : {', '.join(DEAD_HOSTS)}")
+
+    if DESDE_COLA:
+        global COLA_INTRUSO
+        COLA_INTRUSO, ruta_cola = _cargar_cola_intruso()
+        if not COLA_INTRUSO:
+            print(f"❌ --desde-cola pero no hay cola de Intruso en {ruta_cola}.")
+            print("   Lánzala antes con: 06_intruso.py --barrer")
+            return 1
+        print(f"📋 Cola de Intruso: {len(COLA_INTRUSO)} descripciones originales "
+              f"({os.path.basename(ruta_cola)})")
+        print("   Las páginas que Intruso ya limpió se reconstruyen sobre su original.")
+
     _auditar_cascada(rl_config)
 
     update_status("UNIT3D", "Regeneración de Imágenes", "PROCESSING",

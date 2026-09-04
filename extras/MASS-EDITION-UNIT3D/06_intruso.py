@@ -27,6 +27,7 @@ Uso:
     python3 06_intruso.py --reponer [--real] [--limite N]
 """
 
+import collections
 import json
 import os
 import random
@@ -88,6 +89,46 @@ LIMPIADOS = os.path.join(ESTADO, f"intruso_limpiados_{_SUF}.txt")
 MANUAL    = os.path.join(ESTADO, f"intruso_manual_{_SUF}.txt")
 
 _ARGS = set(sys.argv[1:])
+
+# Identificador de tirada. Los informes se abren en modo append, asi que sin
+# esto lo de hoy y lo de hace tres dias quedan pegados en el mismo fichero sin
+# nada que los separe: 10.128 lineas seguidas de varias pasadas distintas, y
+# ninguna forma de saber cual es de cual salvo borrar el fichero entero.
+_TIRADA = time.strftime("%Y%m%d_%H%M%S")
+
+# Los ficheros que ya llevan cabecera de ESTA tirada. Se escribe una sola vez
+# por fichero, en la primera anotacion, y no antes: una tirada que no anota
+# nada no ensucia el informe con una cabecera huerfana.
+_CON_CABECERA = set()
+
+
+def _modo_tirada():
+    """Como se lanzo, para que la cabecera lo diga."""
+    modos = [a.lstrip("-") for a in ("--limpiar", "--reponer", "--barrer")
+             if a in _ARGS]
+
+    return "+".join(modos) or "sin-modo"
+
+
+def _cabecera_tirada(ruta, columnas=None):
+    """Abre el bloque de esta tirada en `ruta`, una vez.
+
+    Devuelve lo que hay que escribir antes de la primera fila: la linea de
+    columnas si el fichero es nuevo, y siempre el separador de tirada.
+    """
+    if ruta in _CON_CABECERA:
+        return ""
+
+    _CON_CABECERA.add(ruta)
+    trozos = []
+
+    if not os.path.exists(ruta) and columnas:
+        trozos.append(columnas)
+
+    trozos.append(f"# === tirada {_TIRADA} · {_modo_tirada()} · {_SUF} · "
+                  f"{'SIMULACRO' if DRY_RUN else 'REAL'} ===")
+
+    return "\n".join(trozos) + "\n"
 
 
 def _dry_run():
@@ -236,6 +277,95 @@ def _imagenes_vivas(s):
     return vivas
 
 
+# ==========================================
+# 🖼️  QUÉ CUENTA COMO CAPTURA
+# ==========================================
+# Contar etiquetas `[img]` NO es contar capturas. Auditoría del 2026-08-26
+# sobre los 7138 torrents vivos de NOBS: 3540 descripciones llevan el banner de
+# firma del uploader, así que una página con SÓLO su firma parecía tener
+# galería. El inventario salió a 52 cuando la cifra real era 113.
+#
+# La separación no necesita lista blanca de hosts escrita a mano: una URL de
+# imagen que aparece en MUCHAS descripciones es plantilla; una que aparece en
+# una sola es una captura. Medido en ese corpus: 35554 URLs salen una vez y
+# sólo 7 salen más de cinco veces — las 7 son firmas y banners. El umbral se
+# recalibra solo cuando mañana haya otra firma.
+UMBRAL_FIRMA = int(os.getenv("ME_INTRUSO_UMBRAL_FIRMA", "5") or 5)
+
+# Qué es una galería COMPLETA. Las tiradas publican 4 (3 ventanas × 2 capturas,
+# topadas por tamaño), así que 4 es el listón.
+#
+# OJO, y esto no es lo mismo: "galería incompleta" no es "página rota". Reparto
+# medido el 2026-08-26 sobre los 7138 vivos, con la cola de la campaña al lado:
+#
+#     capturas   torrents   en la cola
+#            0        113          111   <- lo que rompió la limpieza
+#            1        431           37   <- 394 nadie los tocó: una captura de toda la vida
+#            2         41           30
+#            3         56           39
+#            4       4512         1213   <- repuestos
+#
+# O sea: `tiene_galeria()` sirve para decidir si una página YA está servida
+# (guardarraíl antes de publicar encima), no para inventariar. Como criterio de
+# inventario daría 641 e incluiría 422 páginas que nunca estuvieron rotas. Para
+# inventariar, `sin_capturas()`.
+MIN_CAPTURAS = int(os.getenv("ME_INTRUSO_MIN_CAPTURAS", "4") or 4)
+
+# Aquí no todo el mundo sube con la suite. Hay quien publica UNA imagen ancha
+# que por dentro es un mosaico de 9 capturas, y contarla como "una captura" la
+# marcaría rota para siempre. El ancho declarado en `[img=N]` la delata, y el
+# corte sale limpio del reparto medido:
+#
+#     350-800px   capturas normales (500 y 600 son el 97%)
+#     1080px      capturas grandes sueltas — NO son mosaicos (5219, 5486)
+#     1273-1973px 18 torrents, todos mosaico de una pieza
+#
+# De ahí 1200: por encima sólo hay mosaicos. Se mide el ancho DECLARADO, no el
+# real, porque es lo único que trae la descripción; un mosaico sin `[img=N]` se
+# escapa y cae en la lista de revisión, que es el lado seguro por el que fallar.
+ANCHO_MOSAICO = int(os.getenv("ME_INTRUSO_ANCHO_MOSAICO", "1200") or 1200)
+
+RX_IMG_ANCHO = re.compile(r"\[img=(\d+)\]\s*([^\[\s]+)\s*\[/img\]", re.IGNORECASE)
+
+
+def firmas_del_corpus(descripciones):
+    """URLs de imagen que se repiten entre descripciones: firmas y banners.
+
+    Se calcula sobre el corpus que ya se está leyendo, no sobre una lista fija:
+    cada tracker tiene sus propias plantillas y cambian con el tiempo.
+    """
+    veces = collections.Counter()
+    for d in descripciones:
+        for u in set(_imagenes_vivas(d)):
+            veces[u] += 1
+    return {u for u, n in veces.items() if n > UMBRAL_FIRMA}
+
+
+def capturas(desc, firmas=()):
+    """Las imágenes de la descripción que de verdad son capturas."""
+    return [u for u in _imagenes_vivas(desc) if u not in firmas]
+
+
+def mosaicos(desc, firmas=()):
+    """Imágenes anchas: una sola pieza que ES la galería entera."""
+    return [u for a, u in RX_IMG_ANCHO.findall(desc or "")
+            if u not in firmas and int(a) >= ANCHO_MOSAICO]
+
+
+def tiene_galeria(desc, firmas=()):
+    """¿Esta página ya está servida? Ojo: `not tiene_galeria` no es `sin nada`."""
+    return (len(capturas(desc, firmas)) >= MIN_CAPTURAS
+            or bool(mosaicos(desc, firmas)))
+
+
+def sin_capturas(desc, firmas=()):
+    """Ni una sola captura. ESTE es el criterio de inventario, no el de arriba.
+
+    Un mosaico cuenta: la página tiene capturas aunque vengan en una pieza.
+    """
+    return not capturas(desc, firmas) and not mosaicos(desc, firmas)
+
+
 def comprobar_limpieza(antes, despues):
     """El invariante de ESTA fase. No vale el de 05.
 
@@ -263,12 +393,44 @@ def _leer_marcador(ruta):
     if not os.path.exists(ruta):
         return set()
     with open(ruta, "r", encoding="utf-8") as f:
-        return {l.split("\t")[0].strip() for l in f if l.strip()}
+        # Las lineas de `#` son cabeceras de tirada y de columnas: fuera. Sin
+        # esto la cabecera entera entraria como un id "hecho" --inofensivo por
+        # casualidad, porque ningun id se llama asi, pero es una trampa puesta.
+        return {l.split("\t")[0].strip() for l in f
+                if l.strip() and not l.startswith("#")}
 
 
 def _marcar(ruta, tid, extra=""):
+    # La cabecera se resuelve ANTES de abrir: `open(..., "a")` crea el fichero,
+    # asi que preguntar por os.path.exists() con el ya abierto siempre dice que
+    # si y la linea de columnas no se escribiria nunca.
+    cab = _cabecera_tirada(ruta)
     with open(ruta, "a", encoding="utf-8") as f:
+        # Los marcadores de reanudacion (limpiados, repuestos) se releen con
+        # `_leer_marcador`, que salta las lineas de `#`, asi que la cabecera no
+        # les estorba y de paso dice cuando se hizo cada tramo.
+        f.write(cab)
         f.write(f"{tid}\t{extra}\n" if extra else f"{tid}\n")
+
+
+def _leer_manual():
+    """Lo ya anotado, como pares (id, motivo). Cacheado: se relee una vez."""
+    global _MANUAL_YA
+    if _MANUAL_YA is None:
+        _MANUAL_YA = set()
+        try:
+            with open(MANUAL, encoding="utf-8") as f:
+                for l in f:
+                    if l.strip() and not l.startswith("#"):
+                        c = l.rstrip("\n").split("\t")
+                        if len(c) > 3:
+                            _MANUAL_YA.add((c[0].strip(), c[3]))
+        except OSError:
+            pass
+    return _MANUAL_YA
+
+
+_MANUAL_YA = None
 
 
 def _anotar_manual(entrada, motivo):
@@ -276,20 +438,57 @@ def _anotar_manual(entrada, motivo):
 
     Dos escenarios previstos, los dos acaban en borrar el torrent tras revisar:
     sin seeds, o el fichero no da capturas aprovechables.
+
+    Se anota UNA vez por (id, motivo). Sin esa condición el fichero era un log,
+    no un informe: la auditoría del 2026-08-26 lo encontró con 1072 filas para
+    234 ids — el mismo torrent repetido hasta 28 veces, una por tirada. Un
+    motivo NUEVO para el mismo id sí entra: eso es información.
     """
+    tid = str(entrada.get("id", "?"))
+    ya = _leer_manual()
+    if (tid, motivo) in ya:
+        return
     try:
-        nuevo = not os.path.exists(MANUAL)
+        cab = _cabecera_tirada(
+            MANUAL, "# id\tseeders\tuploader\tmotivo\tnombre\turl")
         with open(MANUAL, "a", encoding="utf-8") as f:
-            if nuevo:
-                f.write("# id\tseeders\tuploader\tmotivo\tnombre\turl\n")
+            f.write(cab)
             f.write("\t".join([
-                str(entrada.get("id", "?")),
+                tid,
                 str(entrada.get("seeders", "?")),
                 str(entrada.get("uploader", "?")),
                 motivo,
                 str(entrada.get("nombre", ""))[:80],
                 f"{SITE_BASE}/torrents/{entrada.get('id')}",
             ]) + "\n")
+        ya.add((tid, motivo))
+    except OSError:
+        pass
+
+
+def _olvidar_manual(tid):
+    """Saca un torrent de la lista de revisión: ya no hay nada que revisar.
+
+    La otra mitad del mismo problema. Un fallo anotaba el torrent y el reintento
+    que salía bien no lo desanotaba, así que 127 de los 234 ids de la lista ya
+    tenían capturas cuando se auditó. La lista sólo sabía crecer.
+    """
+    tid = str(tid)
+    try:
+        with open(MANUAL, encoding="utf-8") as f:
+            lineas = f.readlines()
+    except OSError:
+        return
+    quedan = [l for l in lineas
+              if l.startswith("#") or not l.strip()
+              or l.split("\t")[0].strip() != tid]
+    if len(quedan) == len(lineas):
+        return
+    try:
+        with open(MANUAL, "w", encoding="utf-8") as f:
+            f.writelines(quedan)
+        _leer_manual()
+        _MANUAL_YA.difference_update({p for p in _MANUAL_YA if p[0] == tid})
     except OSError:
         pass
 
@@ -305,6 +504,16 @@ def barrer(session):
     cada ~30 páginas y pide hasta ~43 s de espera.
     """
     cola, vistos, pagina = [], set(), 1
+    # Las firmas se reconocen porque se repiten en el catálogo ENTERO, así que
+    # este recuento tiene que ver también las descripciones sanas — no sólo el
+    # subconjunto roto que acaba en la cola.
+    veces_url = collections.Counter()
+    # Y se guardan las descripciones para poder decir, al terminar, CUÁNTAS
+    # páginas se han quedado sin ninguna captura. No se puede decidir sobre la
+    # marcha porque las firmas no se conocen hasta haber visto el catálogo
+    # entero. Son unos 6 MB para 7000 torrents, al lado de la cola que ya se
+    # guarda con sus descripciones completas.
+    desc_por_id = {}
     print("🔭 Barriendo el tracker (esto tarda unos minutos)…", flush=True)
 
     while pagina <= 500:
@@ -334,6 +543,9 @@ def barrer(session):
                 continue
             vistos.add(tid)
             desc = a.get("description") or ""
+            desc_por_id[tid] = desc
+            for u in set(_imagenes_vivas(desc)):
+                veces_url[u] += 1
             muertos = quedan_muertos(desc)
             if not muertos:
                 continue
@@ -353,11 +565,23 @@ def barrer(session):
         pagina += 1
         time.sleep(0.25)
 
+    firmas = {u for u, n in veces_url.items() if n > UMBRAL_FIRMA}
+    huerfanos = sorted((t for t, d in desc_por_id.items() if sin_capturas(d, firmas)),
+                       key=int)
     print(f"✅ Barrido: {len(vistos)} torrents, {len(cola)} con enlaces muertos")
-    return cola, len(vistos)
+    if firmas:
+        print(f"🖼️  {len(firmas)} URL(s) de firma/banner detectadas: no cuentan "
+              f"como capturas.")
+    # El inventario que la lista de revisión nunca supo dar: se cuenta sobre el
+    # tracker, no sobre lo que fue fallando. Incluye páginas que ya estaban sin
+    # capturas antes de esta campaña.
+    print(f"📷 {len(huerfanos)} torrents sin NINGUNA captura "
+          f"({len(huerfanos) - len([t for t in huerfanos if t in {e['id'] for e in cola}])} "
+          f"de ellos fuera de la cola de esta tirada)")
+    return cola, len(vistos), firmas, huerfanos
 
 
-def guardar_cola(cola, total_vistos):
+def guardar_cola(cola, total_vistos, firmas=(), huerfanos=()):
     # Primero lo fácil: si se para a media tirada, queda arreglado lo más
     # rentable. `seeders` viene del barrido, así que el triaje sale gratis.
     cola.sort(key=lambda e: (-int(e.get("seeders") or 0), int(e["id"])))
@@ -365,6 +589,13 @@ def guardar_cola(cola, total_vistos):
         "tracker": _SUF,
         "creada": datetime.now().isoformat(timespec="seconds"),
         "total_en_tracker": total_vistos,
+        # Se guardan con la cola porque la fase 2 corre en otra tirada, horas
+        # después, y no rebarre: sin esto no tendría con qué distinguir una
+        # firma de una captura.
+        "firmas": sorted(firmas),
+        # Inventario del tracker entero, no sólo de lo que rompió la campaña.
+        # Es la lista que de verdad quiere el staff.
+        "sin_capturas": list(huerfanos),
         "entradas": cola,
     })
     print(f"💾 Cola guardada: {COLA}")
@@ -505,26 +736,40 @@ def main():
         cola = guardada["entradas"]
         print(f"\n📋 Cola existente de {guardada.get('creada', '?')}: "
               f"{len(cola)} entradas (no se rebarre).")
+        firmas = set(guardada.get("firmas") or ())
+        if not firmas:
+            # Cola de antes de que existiera el recuento de firmas. Se saca de
+            # las descripciones originales que la propia cola guarda: son menos
+            # que el catálogo entero, pero una firma se repite igual.
+            firmas = firmas_del_corpus(e.get("descripcion_original", "")
+                                       for e in cola)
+            if firmas:
+                print(f"🖼️  {len(firmas)} URL(s) de firma deducidas de la cola "
+                      f"(se barrió antes de que esto existiera).")
     else:
-        cola, total = barrer(session)
+        cola, total, firmas, huerfanos = barrer(session)
         if not cola:
             print("✨ Nada con enlaces muertos. No hay trabajo.")
             return 0
-        guardar_cola(cola, total)
+        guardar_cola(cola, total, firmas, huerfanos)
 
     sin_seeds = [e for e in cola if not int(e.get("seeders") or 0)]
     if sin_seeds:
-        print(f"\n⚠️  {len(sin_seeds)} sin seeds: se limpian igual, pero no se podrán "
-              f"reponer capturas. Van a {os.path.basename(MANUAL)}.")
+        antes = len(_leer_manual())
         for e in sin_seeds:
             _anotar_manual(e, "sin seeds: no se podrán regenerar capturas")
+        nuevos = len(_leer_manual()) - antes
+        print(f"\n⚠️  {len(sin_seeds)} sin seeds: se limpian igual, pero no se "
+              f"podrán reponer capturas."
+              + (f" {nuevos} nuevo(s) a {os.path.basename(MANUAL)}."
+                 if nuevos else " Ya estaban todos anotados."))
 
     if "--barrer" in _ARGS:
         print("\n(--barrer: sólo se ha construido la cola, no se ha tocado nada)")
         return 0
 
     if _ARGS & {"--reponer", "--reparar"}:
-        fase_reponer(session, cola, rl)
+        fase_reponer(session, cola, rl, firmas)
         return 0
 
     fase_limpiar(session, cola)
@@ -564,7 +809,36 @@ PUERTO      = int(os.getenv("ME_INTRUSO_PUERTO", "0"))  # 0 = puerto libre
 # Puerto de escucha efímero (:0). Con uno fijo, dos torrentes seguidos pueden
 # solaparse mientras el anterior suelta el socket, y la sesión nueva se queda
 # sin escuchar — menos peers y ventanas que no llegan.
-IFACE       = os.getenv("ME_INTRUSO_IFACE", "0.0.0.0:0")
+def _iface_salida():
+    """La interfaz por la que de verdad se sale a internet, como `ip:0`.
+
+    Por qué NO vale `0.0.0.0:0`: este contenedor corre en modo `host`, asi que
+    libtorrent ve TODAS las interfaces de la maquina y anuncia una vez por
+    cada una. Medido el 2026-08-24 contra un torrent real: **29 anuncios para
+    un solo torrent** --loopback, LAN, tailscale y una docena de puentes de
+    Docker--. Los puentes fallan con "skipping tracker announce (unreachable)",
+    pero los reales SI llegan, y entonces el tracker ve varios peers distintos
+    con el mismo passkey y acaba rechazando el anuncio con
+    "You already have N peers on this torrent". El sintoma que se ve arriba es
+    "ningun peer respondio" en torrents con seeds de sobra.
+
+    El truco del socket UDP no manda nada: solo le pregunta al kernel que
+    origen usaria para ese destino.
+    """
+    import socket
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("1.1.1.1", 53))
+            return f"{s.getsockname()[0]}:0"
+        finally:
+            s.close()
+    except OSError:
+        return "0.0.0.0:0"
+
+
+IFACE       = os.getenv("ME_INTRUSO_IFACE") or _iface_salida()
 
 
 def _descargar_torrent(session, tid):
@@ -605,7 +879,14 @@ class _ServidorPiezas:
             "listen_interfaces": IFACE,
             "enable_dht": False, "enable_lsd": False,
             "enable_upnp": False, "enable_natpmp": False,
-            "alert_mask": lt.alert.category_t.error_notification,
+            # Sin `tracker` ni `peer` en la mascara no hay forma de saber POR QUE
+            # no hubo peers: el sintoma "ningun peer respondio" tapaba por igual
+            # un rechazo del tracker, cero peers devueltos y peers devueltos que
+            # no conectan. Son tres problemas distintos con tres arreglos
+            # distintos.
+            "alert_mask": (lt.alert.category_t.error_notification
+                           | lt.alert.category_t.tracker_notification
+                           | lt.alert.category_t.peer_notification),
         })
         self.ti = lt.torrent_info(ruta_torrent)
         par = lt.add_torrent_params()
@@ -658,6 +939,8 @@ class _ServidorPiezas:
         # llegan, tope superado), la excepción moría ahí y ffmpeg sólo recibía
         # datos truncados. Se guarda para poder decir QUÉ pasó de verdad.
         self.ultimo_error = None
+        # Lo que se sepa sobre por que no hubo peers; lo rellena esperar_peers.
+        self.diagnostico = None
 
         # Cabecera y cola DEL FICHERO elegido. Sin nada deseado libtorrent
         # anuncia numwant=0 y el tracker no devuelve ni un peer (bloqueo
@@ -672,12 +955,63 @@ class _ServidorPiezas:
                 self.h.set_piece_deadline(p, 1000, 0)
 
     def esperar_peers(self, seg=60):
+        """Peers conectados, y de paso guarda POR QUE no los hubo.
+
+        `self.diagnostico` queda con lo que dijo el tracker y con lo que les
+        paso a las conexiones. Sin eso, un fallo del tracker, un tracker que
+        devuelve cero peers y unos peers que no conectan se veian los tres
+        igual, y no se puede arreglar lo que no se distingue.
+        """
+        import collections
+
+        devueltos = 0
+        del_tracker = []
+        caidas = collections.Counter()
         t0 = time.time()
+
         while time.time() - t0 < seg:
-            if self.h.status().num_peers > 0:
-                return self.h.status().num_peers
+            for a in self.ses.pop_alerts():
+                nombre = type(a).__name__
+
+                if nombre == "tracker_reply_alert":
+                    devueltos = max(devueltos, getattr(a, "num_peers", 0))
+                elif nombre in ("tracker_error_alert", "tracker_warning_alert"):
+                    texto = str(a)
+                    # Los puentes sin salida son ruido conocido, no un motivo.
+                    if "unreachable" not in texto:
+                        del_tracker.append(texto[-120:])
+                elif nombre == "peer_disconnected_alert":
+                    m = str(a)
+                    caidas["upload to upload" if "upload to upload" in m
+                           else "timeout" if "timed out" in m or "timed out" in m.lower()
+                           else "otra"] += 1
+
+            n = self.h.status().num_peers
+
+            if n > 0:
+                self.diagnostico = f"{devueltos} devueltos por el tracker"
+
+                return n
+
             time.sleep(0.5)
+
+        partes = [f"el tracker devolvió {devueltos} peer(s)"]
+
+        if del_tracker:
+            partes.append("dijo: " + " | ".join(dict.fromkeys(del_tracker))[:160])
+
+        if caidas:
+            partes.append("caídas: " + ", ".join(f"{v}×{k}" for k, v in caidas.most_common()))
+
+        self.diagnostico = "; ".join(partes)
+
         return 0
+
+    def peers_ahora(self):
+        try:
+            return self.h.status().num_peers
+        except Exception:                                    # noqa: BLE001
+            return -1
 
     def bajado_mib(self):
         return self.h.status().total_done / 2 ** 20
@@ -776,15 +1110,60 @@ class _ServidorPiezas:
             pass
 
 
+_MAPA_LOCAL = None
+
+
+def _fichero_local(tid, rl_config):
+    """La ruta en disco de este torrent, si el cliente ya lo tiene sembrando.
+
+    Por que existe: el 82% de la cola de MILNU son torrents que esta misma
+    maquina ya siembra. Bajarselos por BitTorrent es absurdo --y encima suele
+    FALLAR, porque el tracker nos devuelve nuestro propio peer con la IP
+    publica y el router no hace hairpin NAT: nos pasamos 60 segundos
+    intentando conectarnos a nosotros mismos para leer un fichero que esta a
+    un `open()` de distancia.
+
+    El mapeo id -> fichero lo construye ya `05_image_regenerator` leyendo el
+    comentario que UNIT3D deja dentro del .torrent. Se reutiliza tal cual: se
+    carga el cacheado y, si no esta, se pregunta al cliente UNA vez por tirada.
+    """
+    global _MAPA_LOCAL
+
+    if _MAPA_LOCAL is None:
+        _MAPA_LOCAL = R._cargar_json(R.MAPA_QBIT) or {}
+
+        if not _MAPA_LOCAL:
+            try:
+                _MAPA_LOCAL = R.construir_mapa(SITE_BASE, rl_config) or {}
+            except Exception as e:                            # noqa: BLE001
+                print(f"   (no se pudo consultar el cliente torrent: {e})", flush=True)
+                _MAPA_LOCAL = {}
+
+    ruta = _MAPA_LOCAL.get(str(tid))
+
+    if not ruta or not os.path.exists(ruta):
+        return None
+
+    # content_path puede ser una carpeta (packs de temporada).
+    return R.elegir_fichero(ruta)
+
+
 def capturar_desde_torrent(entrada, rl_config, img_host, session):
     """Baja unas ventanas del fichero, saca capturas y las sube.
 
     Devuelve (image_list, None) o (None, motivo). No deja datos en disco.
     """
     tid = entrada["id"]
-    ruta_torrent, err = _descargar_torrent(session, tid)
-    if err:
-        return None, err
+
+    # Atajo: si el fichero ya esta en disco no hace falta ni el .torrent.
+    local = _fichero_local(tid, rl_config)
+
+    ruta_torrent = None
+
+    if local is None:
+        ruta_torrent, err = _descargar_torrent(session, tid)
+        if err:
+            return None, err
 
     destino = os.path.join(DATOS_TMP, f"d{tid}")
     os.makedirs(destino, exist_ok=True)
@@ -792,19 +1171,56 @@ def capturar_desde_torrent(entrada, rl_config, img_host, session):
     os.makedirs(carpeta, exist_ok=True)
     srv = None
     try:
-        srv = _ServidorPiezas(ruta_torrent, destino)
-        peers = srv.esperar_peers()
-        if not peers:
-            return None, "ningún peer respondió (¿sin seeds ahora mismo?)"
+        if local is not None:
+            # Ni libtorrent, ni peers, ni esperas: ffprobe y ffmpeg aceptan una
+            # ruta igual que una URL, asi que el resto del camino no cambia.
+            url = local
+            print(f"    📁 en disco: {os.path.basename(local)}", flush=True)
+        else:
+            srv = _ServidorPiezas(ruta_torrent, destino)
+            peers = srv.esperar_peers()
+            if not peers:
+                return None, f"ningún peer conectó — {srv.diagnostico or 'sin datos'}"
 
-        url = srv.arrancar()
+            url = srv.arrancar()
 
-        pr = subprocess.run(["ffprobe", "-v", "error", "-seekable", "1",
-                             "-show_entries", "format=duration", "-of", "csv=p=0", url],
-                            capture_output=True, text=True, timeout=300)
+        # `-seekable 1` es una opcion del protocolo HTTP: le dice al servidor de
+        # piezas que acepta peticiones por rango. Contra un fichero local el
+        # rango valido es [-1 - 0] y ffprobe se planta con "Numerical result out
+        # of range" sin leer nada, o sea que la captura fallaba justo en los
+        # torrents que YA estaban en disco. Va solo cuando hay servidor.
+        op_seek = [] if srv is None else ["-seekable", "1"]
+
+        # stdin cerrado por lo mismo que ffmpeg: ver la nota de _captura.
+        # El tope baja de 300s a 200s a proposito: `_asegurar` se rinde a los
+        # ESPERA_MAX (180s por defecto), asi que esperar 300 solo anadia dos
+        # minutos de nada por cada fallo y tapaba el motivo real con un
+        # "timed out" generico.
+        try:
+            pr = subprocess.run(["ffprobe", "-v", "error", *op_seek,
+                                 "-show_entries", "format=duration", "-of", "csv=p=0", url],
+                                capture_output=True, text=True,
+                                timeout=max(60, ESPERA_MAX + 20),
+                                stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            # ffprobe se queda esperando datos que el servidor de piezas nunca
+            # le da. El motivo de verdad --que piezas faltaban, si se supero el
+            # tope-- lo guardo el hilo del servidor; sin esto salia un
+            # "Command [...] timed out" de 200 caracteres que no dice nada.
+            if srv is None:
+                return None, "ffprobe no pudo leer el fichero local (¿corrupto o incompleto?)"
+
+            return None, (f"las piezas no llegaron — {srv.ultimo_error}"
+                          if srv.ultimo_error else
+                          f"ffprobe agotó {max(60, ESPERA_MAX + 20)}s sin recibir datos"
+                          f" ({srv.bajado_mib():.1f} MiB bajados, {srv.peers_ahora()} peer(s))")
         dur = float((pr.stdout or "0").strip() or 0)
         if dur <= 0:
-            return None, "ffprobe no pudo leer la duración"
+            # El servidor de piezas corre en otro hilo y guarda ahi lo que de
+            # verdad fallo. Sin esto, un "las piezas no llegaron" se veia como
+            # un escueto "ffprobe no pudo leer la duracion".
+            return None, ((srv.ultimo_error if srv else None)
+                          or "ffprobe no pudo leer la duración")
 
         # Aquí el tonemap va EN ORIGEN, no al recodificar: estas capturas las
         # genera nuestro propio ffmpeg, así que se convierte desde el vídeo de
@@ -824,10 +1240,19 @@ def capturar_desde_torrent(entrada, rl_config, img_host, session):
                 if ts >= dur:
                     continue
                 salida = os.path.join(carpeta, f"intruso-{int(v)}-{k}.{_EXT_CAP}")
-                subprocess.run(["ffmpeg", "-y", "-v", "error", "-seekable", "1",
+                # `-nostdin` y stdin cerrado: ffmpeg pone el terminal en modo
+                # crudo para sus atajos interactivos y, si muere de mala manera
+                # --y este `timeout=` lo mata con SIGKILL-- NO lo restaura. El
+                # terminal se queda sin icanon, sin echo y sin icrnl, o sea que
+                # Enter pasa a mandar CR y ningun input() vuelve a ver un salto
+                # de linea: el lanzador parece colgado cuando lo unico roto es
+                # la terminal. Paso justo lo que tenia que pasar: el tracker se
+                # cayo, ffmpeg se quedo esperando datos, salto el timeout.
+                subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", *op_seek,
                                 "-ss", str(int(ts)), "-i", url,
                                 "-frames:v", "1", *vf, "-q:v", _Q_CAP, salida],
-                               capture_output=True, text=True, timeout=600)
+                               capture_output=True, text=True, timeout=600,
+                               stdin=subprocess.DEVNULL)
                 if os.path.exists(salida) and os.path.getsize(salida) > _MIN_CAP:
                     pngs.append(os.path.basename(salida))
                 if len(pngs) >= MAX_CAPS:
@@ -836,15 +1261,23 @@ def capturar_desde_torrent(entrada, rl_config, img_host, session):
                 break
 
         if not pngs:
-            motivo = srv.ultimo_error or "ffmpeg no devolvió ningún fotograma útil"
+            motivo = (srv.ultimo_error if srv else None) or "ffmpeg no devolvió ningún fotograma útil"
             return None, f"sin capturas aprovechables ({motivo})"
 
-        print(f"    📥 {srv.bajado_mib():.0f} MiB bajados · {len(pngs)} capturas", flush=True)
+        if srv:
+            print(f"    📥 {srv.bajado_mib():.0f} MiB bajados · {len(pngs)} capturas", flush=True)
+        else:
+            print(f"    🎞️  {len(pngs)} capturas desde el fichero local", flush=True)
 
         from src.prep import Prep
         prep = Prep(screens=len(pngs), img_host=img_host, config=rl_config)
         meta = {"base_dir": R.RAWLOADRR_DIR, "uuid": os.path.basename(carpeta),
-                "path": srv.ruta, "filename": "intruso", "image_list": [],
+                # Con servidor de piezas es el fichero a medio bajar del
+                # temporal; en local, el de la biblioteca. `upload_screens` no
+                # lo lee --sube lo que haya en base_dir/tmp/uuid-- pero va
+                # correcto por si algun dia lo mira.
+                "path": srv.ruta if srv else local,
+                "filename": "intruso", "image_list": [],
                 "imghost": img_host, "ffdebug": False, "vapoursynth": False}
         cwd = os.getcwd()
         try:
@@ -864,10 +1297,14 @@ def capturar_desde_torrent(entrada, rl_config, img_host, session):
             srv.cerrar()
         for d in (destino, carpeta):
             shutil.rmtree(d, ignore_errors=True)
-        try:
-            os.remove(ruta_torrent)
-        except OSError:
-            pass
+        # Con fichero local no se descarga ningun .torrent, asi que aqui no hay
+        # nada que borrar. `os.remove(None)` lanzaria TypeError, que este
+        # `except OSError` NO atrapa: reventaria la limpieza entera.
+        if ruta_torrent:
+            try:
+                os.remove(ruta_torrent)
+            except OSError:
+                pass
 
 
 def _descripcion_con_galeria(original, actual, image_list):
@@ -956,7 +1393,7 @@ def _esperar_tracker(session):
     return False
 
 
-def reponer_uno(session, entrada, rl_config, img_host):
+def reponer_uno(session, entrada, rl_config, img_host, firmas=()):
     tid = entrada["id"]
     if not int(entrada.get("seeders") or 0):
         return False, "sin seeds: no hay de dónde sacar las capturas"
@@ -967,6 +1404,15 @@ def reponer_uno(session, entrada, rl_config, img_host):
     actual, err = R.leer_descripcion(session, SITE_BASE, tid, soup)
     if err:
         return False, err
+
+    # Guardarraíl: la página puede haberse arreglado por otro camino desde que
+    # se hizo la cola —05, el propio uploader, una tirada anterior cuyo marcador
+    # no llegó a escribirse—. Sin esto se le planta una SEGUNDA galería encima,
+    # y no había nada en la ruta que lo impidiera. Va antes de capturar: así no
+    # gasta descarga, ni CPU, ni cuota del host de imágenes.
+    ya = capturas(actual, firmas)
+    if len(ya) >= MIN_CAPTURAS:
+        return True, f"ya tenía {len(ya)} capturas: no se toca"
 
     image_list, err = capturar_desde_torrent(entrada, rl_config, img_host, session)
     if err:
@@ -992,14 +1438,33 @@ def reponer_uno(session, entrada, rl_config, img_host):
     return True, f"{len(image_list)} imagen(es) publicadas, {donde}"
 
 
-def fase_reponer(session, cola, rl_config):
+def fase_reponer(session, cola, rl_config, firmas=()):
     img_host = R._elegir_img_host(rl_config)
     hechos = _leer_marcador(REPUESTOS)
-    # El selector es la COLA, no los enlaces: la fase 1 ya los quitó. Primero
-    # los que más seeds tienen, que son los que menos van a hacer esperar.
+    # El selector es la COLA, no los enlaces: la fase 1 ya los quitó.
     pend = [e for e in cola
             if e["id"] not in hechos and int(e.get("seeders") or 0) > 0]
-    pend.sort(key=lambda e: -int(e.get("seeders") or 0))
+
+    # Primero los que ya están en disco: no dependen de nadie, no pueden
+    # fallar por falta de peers y se despachan en segundos. Son el 82% de la
+    # cola de MILNU, y antes caían al final porque su recuento de seeds es
+    # bajo. Dentro de cada grupo, los que más seeds tienen primero: son los
+    # que menos van a hacer esperar.
+    #
+    # El mapeo se consulta UNA vez aquí, no una por torrent.
+    try:
+        mapa = R._cargar_json(R.MAPA_QBIT) or {}
+    except Exception:                                         # noqa: BLE001
+        mapa = {}
+
+    pend.sort(key=lambda e: (0 if str(e["id"]) in mapa else 1,
+                             -int(e.get("seeders") or 0)))
+
+    en_disco = sum(1 for e in pend if str(e["id"]) in mapa)
+
+    if en_disco:
+        print(f"\n📁 {en_disco} de {len(pend)} ya están en disco: esos van primero "
+              f"y no necesitan BitTorrent.")
     if LIMITE:
         pend = pend[:LIMITE]
 
@@ -1022,7 +1487,7 @@ def fase_reponer(session, cola, rl_config):
         tracker_ko = False
         for _intento in range(3):
             try:
-                ok, msg = reponer_uno(session, e, rl_config, img_host)
+                ok, msg = reponer_uno(session, e, rl_config, img_host, firmas)
             except Exception as ex:
                 ok, msg = False, f"excepción: {ex}"
             if ok or not _es_tracker_caido(msg):
@@ -1045,6 +1510,9 @@ def fase_reponer(session, cola, rl_config):
             print(f"    ✨ {msg}", flush=True)
             if not DRY_RUN:
                 _marcar(REPUESTOS, e["id"])
+                # Este torrent ya no hay que mirarlo a mano. Si un intento
+                # anterior lo dejó anotado, la anotación caduca aquí.
+                _olvidar_manual(e["id"])
         else:
             fail_n += 1
             seguidos += 1
