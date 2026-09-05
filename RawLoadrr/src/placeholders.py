@@ -68,6 +68,41 @@ def es_placeholder(valor, *nombres):
     return alto in variantes
 
 
+def falta_por_preguntar(default_config, campo, *nombres):
+    """¿Hay que PREGUNTARLE al usuario por esta clave?
+
+    No es lo mismo que `es_placeholder()`, y confundirlas tiene un síntoma muy
+    concreto: la aduana decía "Enter para dejarla vacía; no se vuelve a
+    preguntar", guardaba la cadena vacía... y volvía a preguntar en el arranque
+    siguiente, y en el siguiente. Reportado desde una instalación real.
+
+    La causa es que una cadena vacía responde distinto a dos preguntas:
+
+      - "¿es una credencial usable?"  -> NO. `es_placeholder("")` es True, y
+        está bien: mandarle "" a Google Books no autentica nada.
+      - "¿es un hueco sin contestar?" -> tampoco. Es una RESPUESTA: quien la
+        dejó en blanco ya dijo "esta no la uso".
+
+    Así que se pregunta cuando el campo todavía no existe --instalación nueva, o
+    alguien que viene de una versión anterior-- o cuando existe con un hueco que
+    NO sea la cadena vacía. Un `''` escrito en config.py es una decisión tomada,
+    y se respeta.
+
+    Ojo: esto no vale para una clave obligatoria. Sin `tmdb_api` no se puede
+    subir nada, así que ahí hay que seguir insistiendo aunque la dejen vacía;
+    quien llama decide.
+    """
+    if campo not in (default_config or {}):
+        return True
+
+    valor = (default_config or {}).get(campo)
+
+    if str(valor if valor is not None else "").strip() == "":
+        return False
+
+    return es_placeholder(valor, *nombres)
+
+
 def limpiar(valor, *nombres):
     """El valor, o cadena vacía si es un hueco.
 

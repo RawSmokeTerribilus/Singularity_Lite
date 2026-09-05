@@ -98,11 +98,34 @@ def classify(name, only=None):
 # y elegir por él es elegir mal la mitad de las veces.
 MAYORIA = 0.70
 
-# Un instalador es software, y en esta casa software es juego. `autorun.inf` y
-# `setup.exe` juntos no son ambiguos: ningún DVD de película los lleva, y son
-# exactamente lo que trae la ISO que destapó todo esto.
-_MARCAS_INSTALADOR = ('autorun.inf', 'setup.exe', 'install.exe', 'autorun.exe')
-_EXTS_INSTALADOR = ('.exe', '.msi', '.bat', '.com', '.dll')
+# ...y qué parte del envase ENTERO tienen que ser esas entradas reconocibles
+# para que su voto valga algo.
+#
+# Esta segunda condición faltaba, y costó dos falsos positivos en producción:
+# "Command and Conquer Red Alert 3.iso" salía e-book con el motivo "17 de 17
+# entradas reconocibles son de e-book". Unanimidad aparente -- y eran los 17
+# manuales en PDF del juego sobre 2.276 ficheros, el 0,75%. Los otros 2.259, que
+# son el juego, no votaban porque ninguna de sus extensiones está en lista.
+#
+# Un puñado de manuales dentro de un juego es un accesorio, igual que el
+# `caratulas.zip` dentro de la carpeta de una película. La misma regla, un
+# nivel más abajo.
+SUELO_ABRUMADOR = 0.50      # con esto manda el recuento aunque haya otras señales
+SUELO_DEBIL     = 0.20      # por debajo, el recuento no decide solo
+
+# Señales de que el envase ENTERO es software de PC, y en esta casa software de
+# PC es juego. No dependen de cuántos ficheros haya: valen por estar.
+#
+# `autorun.inf` y `setup.exe` NO bastaban. Medido sobre los dos ficheros reales
+# que trajo la uploader: ninguno de los dos los lleva. Lo que llevan es
+# `ra3.exe` y `cnc3ep1.exe` en la raíz, `.dll`, `.skudef` de EA e
+# `installscript.vdf` de Steam.
+_MARCAS_INSTALADOR = ('autorun.inf', 'setup.exe', 'install.exe', 'autorun.exe',
+                      'installscript.vdf')
+# Un `.exe` o un `.dll` es decisivo por sí solo: un pack de libros no trae
+# DLLs, y una temporada de una serie tampoco.
+_EXTS_SOFTWARE = ('.exe', '.dll', '.msi', '.ocx', '.sys', '.skudef', '.vdf')
+_EXTS_INSTALADOR = _EXTS_SOFTWARE + ('.bat', '.com')
 
 
 def classify_container(path, only=None):
@@ -136,40 +159,62 @@ def classify_container(path, only=None):
 
     # 2. Recuento por extensión, con el MISMO clasificador que se usa para un
     #    directorio. Un envase es un directorio, sólo que cerrado.
+    #
+    #    El recuento se mide SIEMPRE contra el total del envase, nunca contra
+    #    "las que he sabido reconocer": esa división es la que hacía que 17
+    #    manuales entre 2.276 ficheros salieran como "17 de 17, unanimidad".
     por_tipo = {}
     for nombre in nombres:
         kind = classify(os.path.basename(str(nombre).rstrip('/')), only)
         if kind:
             por_tipo[kind] = por_tipo.get(kind, 0) + 1
 
-    total = sum(por_tipo.values())
-    if total:
-        gana, n = max(por_tipo.items(), key=lambda kv: kv[1])
-        if n / total >= MAYORIA:
-            return gana, f"{n} de {total} entradas reconocibles son de {LABELS[gana]}"
-        detalle = ", ".join(f"{c} de {LABELS[k]}" for k, c in
-                            sorted(por_tipo.items(), key=lambda kv: -kv[1]))
-        return None, f"dentro hay mezcla ({detalle})"
+    total = len(nombres)
+    reconocidas = sum(por_tipo.values())
+    gana, n = max(por_tipo.items(), key=lambda kv: kv[1]) if por_tipo else (None, 0)
+    decisivo = bool(reconocidas) and n / reconocidas >= MAYORIA
+    cuota = reconocidas / total if total else 0.0
+    motivo_recuento = f"{n} de {total} entradas son de {LABELS[gana]}" if gana else ""
 
-    # 3. Ninguna extensión conocida. Es el caso normal de un juego: ni un zip de
-    #    ScummVM ni un instalador de DOS traen extensiones que estén en ninguna
-    #    lista. Se le pregunta a gameinfo, que sabe de sistemas.
+    # 2a. Un recuento ABRUMADOR manda sobre todo lo demás. Es el pack de
+    #     biblioteca: 300.000 epubs mandan aunque traiga un lector .exe suelto.
+    if decisivo and cuota >= SUELO_ABRUMADOR:
+        return gana, motivo_recuento
+
+    # 3. Señales de ARCHIVO ENTERO. Valen por estar, no por cuántas sean, y por
+    #    eso van antes que un recuento flojo: un juego de PC son miles de
+    #    ficheros con extensiones que no está en ninguna lista, y lo poco que se
+    #    reconoce dentro suele ser el accesorio (los manuales), no la obra.
     sistema = gameinfo._detect_system(path, [{'nombre': n} for n in nombres])
     if sistema and sistema not in ('Disco', 'Disco (CHD)'):
         return 'game', f"el contenido es de {sistema}"
 
-    # 4. Un instalador. Es la señal que resuelve el caso original --
-    #    "Command and Conquer Red Alert 3.iso" trae autorun.inf y setup.exe --
-    #    y va la ÚLTIMA porque un .exe suelto dentro de otra cosa no convierte
-    #    esa cosa en un juego.
-    base = {os.path.basename(str(n).rstrip('/')).lower() for n in nombres}
+    base = {os.path.basename(str(x).rstrip('/')).lower() for x in nombres}
+
     marcas = base & set(_MARCAS_INSTALADOR)
     if marcas:
         return 'game', f"trae {sorted(marcas)[0]}: es un instalador"
 
-    ejecutables = sum(1 for n in base if n.endswith(_EXTS_INSTALADOR))
-    if ejecutables and ejecutables / len(base) >= 0.10:
-        return 'game', f"{ejecutables} ejecutables de {len(base)} entradas: es software"
+    # Un .exe o un .dll no admite discusión: ni los libros ni el vídeo ni la
+    # música traen binarios de Windows. Da igual que sean 9 entre 1.251.
+    software = sorted({os.path.splitext(x)[1] for x in base
+                       if x.endswith(_EXTS_SOFTWARE)})
+    if software:
+        cuantos = sum(1 for x in base if x.endswith(_EXTS_SOFTWARE))
+        return 'game', (f"{cuantos} ficheros de software ({', '.join(software)}): "
+                        f"es un programa, no una obra leída ni vista")
+
+    # 4. Y si no hay señal fuerte, vale un recuento moderado.
+    if decisivo and cuota >= SUELO_DEBIL:
+        return gana, motivo_recuento
+
+    if reconocidas:
+        detalle = ", ".join(f"{c} de {LABELS[k]}" for k, c in
+                            sorted(por_tipo.items(), key=lambda kv: -kv[1]))
+        if decisivo:
+            return None, (f"sólo {reconocidas} de {total} entradas dicen algo "
+                          f"({detalle}): muy poco para decidir por ellas")
+        return None, f"dentro hay mezcla ({detalle}, de {total} entradas)"
 
     return None, "abierto, pero nada de dentro dice qué es"
 

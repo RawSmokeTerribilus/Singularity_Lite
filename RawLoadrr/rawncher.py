@@ -29,7 +29,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from core.status_manager import update_status
 from src.console import console
-from src.placeholders import es_placeholder
+from src.placeholders import es_placeholder, falta_por_preguntar
 from rich.prompt import Prompt, Confirm
 from rich.panel import Panel
 from rich.table import Table
@@ -99,8 +99,24 @@ class Rawncher:
                 # El hueco se reconoce en src/placeholders.py, no aquí: había
                 # tres formatos distintos y la comprobación de antes sólo veía
                 # el prefijo YOUR_.
-                if es_placeholder(val, env_key, python_key):
-                    obligatoria = python_key == "tmdb_api"
+                obligatoria = python_key == "tmdb_api"
+
+                # Una clave dejada en blanco A PROPOSITO es una respuesta, no un
+                # hueco: `es_placeholder("")` es True --y hace bien, "" no
+                # autentica nada-- pero preguntar por ella otra vez es no haber
+                # escuchado. Reportado desde una instalacion real: "dice que no
+                # se volvera a preguntar pero cada vez que abro rawloadrr me las
+                # pide".
+                #
+                # La obligatoria es la excepcion: sin tmdb_api no se sube nada,
+                # asi que ahi se sigue insistiendo aunque la dejen vacia.
+                if obligatoria:
+                    hay_hueco = es_placeholder(val, env_key, python_key)
+                else:
+                    hay_hueco = falta_por_preguntar(default_config, python_key,
+                                                    env_key, python_key)
+
+                if hay_hueco:
 
                     console.print(f"\n[bold red]✖ {env_key} no configurada o tiene valor por defecto.[/bold red]")
 
