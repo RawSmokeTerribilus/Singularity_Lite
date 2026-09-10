@@ -1464,9 +1464,11 @@ def dupe_check(dupes, meta, config, skipped_details, path):
 
             if similarity >= similarity_threshold:
                 log.info(f"[yellow]Close size match ({abs(meta_size - size)} bytes difference) with {similarity * 100:.2f}% name similarity.")
-                upload = Confirm.ask(" Upload anyways?")
-                if not upload:
-                    meta['upload'] = False
+                # handle_similarity() es la única rama que mira 'unattended'. Un
+                # Confirm.ask() suelto en una tirada desatendida no pregunta a
+                # nadie: da por buena la subida y el duplicado entra.
+                meta, saltado = handle_similarity(similarity, meta)
+                if saltado:
                     return meta, True #Skip Upload
             else:
                 log.info(f"[green]Close size match, but low name similarity ({similarity * 100:.2f}%). Proceeding.")
@@ -1479,9 +1481,8 @@ def dupe_check(dupes, meta, config, skipped_details, path):
 
             if similarity >= similarity_threshold:
                 log.info(f"[yellow]Large size difference but high name similarity ({similarity * 100:.2f}%). Treating as potential dupe.")
-                upload = Confirm.ask(" Upload anyways?")
-                if not upload:
-                    meta['upload'] = False
+                meta, saltado = handle_similarity(similarity, meta)
+                if saltado:
                     return meta, True #Skip Upload
             else:
                 console.print(f"[green]Large size difference and low name similarity ({similarity * 100:.2f}%). Proceeding.")

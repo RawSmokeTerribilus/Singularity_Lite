@@ -493,7 +493,7 @@ class Prep():
 
             meta['tmdb'] = meta.get('tmdb_manual', None)
             if meta.get('type', None) is None:
-                meta['type'] = self.get_type(video, meta['scene'], meta['is_disc'])
+                meta['type'] = self.get_type(video, meta['scene'], meta['is_disc'], mi, meta.get('resolution'))
             if meta.get('category', None) is None:
                 meta['category'] = self.get_cat(video)
             else:
@@ -2192,9 +2192,87 @@ class Prep():
     Get type and category
     """
 
-    def get_type(self, video, scene, is_disc):
+    # Firmas de recodificación. `mkvmerge` NO entra aquí a propósito: eso es un
+    # muxer, es exactamente lo que hace un remux de verdad.
+    _FIRMAS_ENCODE = ('x264', 'x265', 'lavf', 'handbrake', 'svt-av1', 'svt av1',
+                      'libaom', 'aomenc', 'ffmpeg', 'nvenc', 'vaapi', 'qsv')
+
+    def _remux_desmentido(self, mi, resolution):
+        """
+        ¿Mediainfo desmiente el «remux» que dice el nombre del fichero?
+
+        El nombre no es una prueba. Casi todo el mundo pasa la biblioteca por
+        Tdarr, así que un remux que SÍ lo era al descargarlo llega aquí
+        recodificado a HEVC: el nombre conserva «Remux» y el fichero ya no lo es.
+
+        La prueba tiene que salir de la PISTA DE VÍDEO, no del contenedor. Un
+        `Encoded_Application: Lavf` sólo dice que el mkv lo escribió ffmpeg, y
+        `ffmpeg -c copy` es exactamente lo que hace un remux: medido sobre 102
+        capturas reales, fiarse de esa firma degradaba remuxes buenos cuyo vídeo
+        venía de un encoder de masterización (ATEME Titan File).
+
+        Se desmiente si:
+          1. la pista de vídeo declara un encoder de consumo -- x264, x265, SVT,
+             libaom, HandBrake, NVENC...; un remux copia el flujo, no lo vuelve a
+             comprimir;
+          2. trae ajustes de encoder (`Encoded_Library_Settings`), que sólo
+             existen si alguien comprimió;
+          3. mide 1080 de alto o menos y es HEVC o AV1: un Blu-ray de esa altura
+             es AVC, VC-1 o MPEG-2, nunca HEVC.
+
+        La altura se lee de mediainfo, no del nombre ni de meta['resolution']:
+        hay ficheros llamados «Remux-1080p» que en realidad son 2160p, y
+        degradarlos por creerle al nombre sería el mismo error de siempre.
+
+        Sin mediainfo legible no hay veredicto: se devuelve False y el nombre se
+        sale con la suya, que es preferible a degradar a ciegas.
+        """
+        if not mi:
+            return False
+
+        try:
+            tracks = mi['media']['track']
+        except (KeyError, TypeError):
+            return False
+
+        video = next((t for t in tracks if t.get('@type') == 'Video'), None)
+
+        if video is None:
+            return False
+
+        firmas = ' '.join(str(x) for x in (
+            video.get('Encoded_Library_Name', ''),
+            video.get('Encoded_Library', ''),
+        )).lower()
+
+        if any(f in firmas for f in self._FIRMAS_ENCODE):
+            return True
+
+        if video.get('Encoded_Library_Settings'):
+            return True
+
+        try:
+            alto = int(video.get('Height') or 0)
+        except (TypeError, ValueError):
+            alto = 0
+
+        if not alto:
+            alto = {'2160P': 2160, '1440P': 1440, '1080P': 1080, '1080I': 1080,
+                    '720P': 720, '576P': 576, '576I': 576, '480P': 480,
+                    '480I': 480}.get(str(resolution or '').upper(), 0)
+
+        return 0 < alto <= 1080 and video.get('Format', '') in ('HEVC', 'AV1')
+
+    def get_type(self, video, scene, is_disc, mi=None, resolution=None):
         filename = os.path.basename(video).lower()
-        if "remux" in filename:
+        dice_remux = "remux" in filename
+        # Quitarle el «remux» al nombre no es afirmar que sea un encode de disco:
+        # se cae al resto de la cadena, así que un "WEB-DL Remux" recodificado
+        # acaba en WEBDL y no en ENCODE.
+        if dice_remux and self._remux_desmentido(mi, resolution):
+            log.info(f"[get_type] '{os.path.basename(video)}' dice REMUX pero mediainfo lo desmiente")
+            dice_remux = False
+        if dice_remux:
             type = "REMUX"
         elif any(word in filename for word in [" web ", ".web.", "web-dl"]):
             type = "WEBDL"

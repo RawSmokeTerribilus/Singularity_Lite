@@ -685,7 +685,14 @@ class COMMON():
             
         new_dupes = {}
         for each in dupes:
-            remove_set = set({meta.get('resolution')}) if meta.get('sd', 0) != 1 else set()
+            # 'OTHER' es lo que llevan libros, audiolibros y juegos: no es una
+            # resolución, es la ausencia de una. Sembrando el filtro con ella se
+            # exigía que el nombre del candidato contuviera «OTHER» -- cosa que no
+            # pasa nunca -- y se caían TODOS los duplicados antes de mirarlos.
+            # meta['sd'] tampoco vale de guarda: sólo se asigna en la rama de vídeo.
+            _res = meta.get('resolution')
+            _res_filtra = bool(_res) and _res != 'OTHER' and meta.get('sd', 0) != 1
+            remove_set = set({_res}) if _res_filtra else set()
             search_combos = [
                 {'search' : meta.get('hdr', ''), 'search_for' : {'HDR', 'PQ10'}, 'update' : {'HDR|PQ10'}},
                 {'search' : meta.get('hdr', ''), 'search_for' : {'DV'}, 'update' : {'DV|DoVi'}},
