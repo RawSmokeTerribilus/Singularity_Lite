@@ -49,6 +49,12 @@ config = {'AUTO': {'delay': 0, 'description_folder': None, 'dupe_similarity': 80
              'imgchest_api': 'IMGCHEST_API_KEY',
              'imghippo_api': 'IMGHIPPO_API_KEY',
              'inline_imgs': 3,
+             # Grupos de lanzamiento reconocidos. RawLoadrr NO adivina el grupo:
+             # sólo pone tag si el nombre del fichero o de la carpeta trae uno
+             # de estos (como `-GRUPO` al final o `[GRUPO]`) o uno de los
+             # `internal_groups` de cualquier tracker. Para subir con un grupo
+             # que no esté aquí: `-g GRUPO`. Vacío = nunca tag automático.
+             'known_groups': [],
              'oeimg_api': 'OEIMG_API',
              'optimize_images': True,
              'ptscreens_api': 'PTSCREENS_API',

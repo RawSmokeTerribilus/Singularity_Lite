@@ -344,11 +344,23 @@ class Prep():
                 videopath, meta['filelist'] = self.get_video(videoloc, meta.get('mode', 'discord')) 
                 video, meta['scene'], meta['imdb'] = self.is_scene(videopath, meta.get('imdb', None))
                 guess_name = ntpath.basename(video).replace('-',' ')
+                import unicodedata
+
+                def _plegar(s):
+                    # Sólo se quitan las marcas combinantes (NFD): «í» -> «i»,
+                    # pero «²» o «Æ» se quedan como estaban.
+                    return ''.join(c for c in unicodedata.normalize('NFD', s)
+                                   if unicodedata.category(c) != 'Mn')
+
                 try:
-                    cleaned = re.sub(r"[^0-9a-zA-Z\[\]]+", " ", guess_name)
+                    # Las tildes se pliegan ANTES de la limpieza ASCII: si no,
+                    # [^0-9a-zA-Z] partía «Pacífico» en «Pac fico», y un título
+                    # en castellano así no lo encuentra ningún proveedor.
+                    _plegado = _plegar(guess_name)
+                    cleaned = re.sub(r"[^0-9a-zA-Z\[\]]+", " ", _plegado)
                     parsed = guessit(cleaned, {"excludes": ["country", "language"]})
                     filename = parsed.get("title") or guessit(
-                        re.sub("[^0-9a-zA-Z]+", " ", guess_name),
+                        re.sub("[^0-9a-zA-Z]+", " ", _plegado),
                         {"excludes": ["country", "language"]}
                     ).get("title") or guess_name
                 except Exception:
@@ -356,7 +368,16 @@ class Prep():
                 _parent = re.sub(r'\s*[-_]?\s*(?<![a-zA-Z])(?:s|season|temporada|saison|staffel|stagione|seizoen|sezon|сезон|시즌|シーズン|季)\s*\d+\s*$', '', ntpath.basename(ntpath.dirname(video)), flags=re.IGNORECASE).strip()
                 _grandparent = re.sub(r'\s*\(\d{4}\)', '', ntpath.basename(ntpath.dirname(ntpath.dirname(video)))).strip()
                 if filename and filename.lower() not in _parent.lower() and filename.lower() not in _grandparent.lower():
-                    filename = _parent if _parent else _grandparent
+                    # La carpeta sustituye al título cuando es el MISMO título
+                    # mejor puntuado («Mayans M.C.») o cuando guessit no sacó nada
+                    # que se le parezca (anime con nombre de episodio). Pero si la
+                    # carpeta es el título MÁS morralla -- «El gran despertar (A
+                    # Great Awakening) (2026) [Bluray 1080p][Esp]» -- el resolver
+                    # recibía el nombre crudo entero y ningún proveedor lo hallaba.
+                    _n = lambda s: re.sub(r"[\W_]+", " ", s.lower()).strip()
+                    _p = _n(_plegar(_parent))
+                    if not (_n(filename) and _n(filename) in _p and _n(filename) != _p):
+                        filename = _parent if _parent else _grandparent
                 untouched_filename = os.path.basename(video)
                 try:
                     meta['search_year'] = guessit(video)['year']
@@ -3542,22 +3563,49 @@ class Prep():
             return ""
 
     def get_tag(self, video, meta):
-        try:
-            tag = guessit(video)['release_group']
-            tag = f"-{tag}"
-        except:
-            tag = ""
-        
-        # Adjust to only keep the last part after the last dash
-        if tag.startswith("-"):
-            parts = tag[1:].split('-')
-            tag = f"-{parts[-1]}"  # Keep only the last part
+        """
+        El grupo de lanzamiento NO se adivina.
 
-        if tag == "-":
-            tag = ""
-        if tag[1:].lower() in ["nogroup", 'nogrp']:
-            tag = ""
-        return tag
+        Antes se le pasaba el nombre del fichero a guessit y se daba por bueno
+        lo que devolviera como release_group. guessit llama grupo a lo que queda
+        detrás del último token que reconoce, y un «en» o un «es» del título de
+        un episodio lo lee como idioma: «El hijo de la viuda en el parabrisas»
+        salía con grupo «el parabrisas». Con nombres de Sonarr («WEBDL-2160p DV
+        HDR10Plus EAC3 5.1 h265») inventaba -HDR10Plus. Medido sobre una
+        biblioteca real: de 179 tags adivinados, 3 eran grupos de verdad. Y no
+        hay regla de forma que lo arregle: en la posición de grupo, guessit
+        acepta igual «-FLUX» que «-Castellano» o «-JA».
+
+        Sólo sale tag si el nombre del fichero o de la carpeta trae, como token
+        delimitado (`-GRUPO` al final o `[GRUPO]`), un grupo CONFIGURADO:
+        DEFAULT['known_groups'] o el `internal_groups` de algún tracker. Para
+        cualquier otro grupo está `-g/--tag`, que ni llega a esta función.
+        Un tag que falta no hace daño; uno inventado ensucia el nombre.
+        """
+        grupos = set(self.config.get('DEFAULT', {}).get('known_groups') or [])
+        for tracker in (self.config.get('TRACKERS') or {}).values():
+            if isinstance(tracker, dict):  # 'default_trackers' es un string
+                grupos.update(tracker.get('internal_groups') or [])
+        grupos = {str(g).strip() for g in grupos if str(g).strip()}
+        if not grupos:
+            return ""
+
+        def _sin_extension(nombre):
+            # splitext a secas se come «.x264-NTb» de una carpeta con puntos.
+            base, ext = os.path.splitext(nombre)
+            return base if ext.lower() in ('.mkv', '.mp4', '.ts', '.avi', '.m2ts') else nombre
+
+        nombres = [_sin_extension(os.path.basename(video))]
+        if meta.get('path'):
+            nombres.append(_sin_extension(os.path.basename(os.path.normpath(meta['path']))))
+
+        # El más largo primero: con "FLUX" y "FLUX+DunA" configurados, gana el completo.
+        for grupo in sorted(grupos, key=len, reverse=True):
+            g = re.escape(grupo)
+            patron = re.compile(rf'(?:-{g}$|\[{g}\])', re.IGNORECASE)
+            if any(patron.search(n) for n in nombres):
+                return f"-{grupo}"
+        return ""
 
 
     def get_source(self, type, video, path, is_disc, meta):
