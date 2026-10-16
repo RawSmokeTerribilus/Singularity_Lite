@@ -10,8 +10,9 @@ Approach: query several providers, normalise every hit to a shared id-set,
 then vote.
   - General providers (always): TMDB, OMDb/IMDB, TVmaze.
         Voting key = the IMDB id (all three expose it).
-  - Anime providers (only when the release looks like anime): MAL via Jikan,
-        AniList. Voting key = the MAL id (AniList exposes idMal).
+  - Anime providers (only when the release looks like anime): MyAnimeList's
+        official API (only with the user's MAL Client ID) and AniList.
+        Voting key = the MAL id (AniList exposes idMal).
 When >=2 providers agree the result is trusted ('high'); a lone hit is 'low';
 nothing usable is 'none' -- the caller should then ask the user.
 
@@ -37,11 +38,13 @@ CONSENSUS_VOTES     = 2      # providers that must agree for "high" confidence
 STRONG_LEAD         = 0.70   # min score for a hit to trigger by-id verification
 SCORE_MARGIN        = 0.15   # how far below the best score a candidate may sit
                              # and still win on votes alone
+EXACT_SCORE         = 0.99   # an exact title(+year) match: only other exact
+                             # matches may compete with it
 TMDB_LANGUAGE       = "es-ES"  # display language asked of TMDB; the catalogue
                               # is Spanish, so an English title scores badly
 
 IMDB_PROVIDERS = ("tmdb", "omdb", "tvmaze")   # vote on the IMDB id
-MAL_PROVIDERS  = ("jikan", "anilist")         # vote on the MAL id (anime)
+MAL_PROVIDERS  = ("mal", "anilist")           # vote on the MAL id (anime)
 
 
 # ─── text helpers ──────────────────────────────────────────────────────────
@@ -437,22 +440,240 @@ def _tvmaze_by_imdb(imdb, log):
     return None
 
 
-# ─── MAL via Jikan (keyless, anime) ────────────────────────────────────────
-def _jikan_search(title, log):
+# ─── ids written in the path ───────────────────────────────────────────────
+# Users (and Radarr/Sonarr) often write the id into the folder or file name:
+# "Title (2005) [tmdb-79200] [tt34672616]", "Show 2019-TVdbID-355229",
+# "Show 2020-364928". There is no fixed convention, so an id found here is
+# only a CLAIM: it is used only when the provider returns a title that matches
+# the name being uploaded. Anything that does not verify is ignored and the
+# normal resolver runs exactly as before.
+PATH_ID_MIN = 0.85   # min _score between the provider's title and the name
+PATH_BARE_MIN = 0.95  # same, for an untagged number (a much weaker claim)
+
+_RE_TMDB = re.compile(r"tmdb(?:id)?\s*[-_=:]?\s*(\d{1,8})(?!\d)", re.I)
+_RE_TVDB = re.compile(r"tvdb(?:id)?\s*[-_=:]?\s*(\d{1,8})(?!\d)", re.I)
+_RE_IMDB = re.compile(r"(?<![a-z0-9])(tt\d{7,9})(?!\d)", re.I)
+_RE_BARE = re.compile(r"(?<![a-z0-9])(\d{4,8})(?![a-z0-9])", re.I)
+
+
+def path_ids(video, extra_path=""):
+    """Collect id claims from the file name and its two parent folders.
+
+    Returns {} when the path carries no id, so callers can skip everything.
+    A bare number (no tmdb/tvdb/tt tag) is a claim only when it is the ONLY
+    non-year 4-8 digit number in its segment.
+    """
+    segs = []
+    for p in (video, extra_path):
+        if not p:
+            continue
+        p = str(p).replace("\\", "/").rstrip("/")
+        parts = p.split("/")
+        base = parts[-1]
+        if "." in base and os.path.splitext(base)[1].lower() in (
+                ".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".iso", ".wmv", ".mov"):
+            base = os.path.splitext(base)[0]
+        for s in [base] + parts[-3:-1][::-1]:
+            if s and s not in segs:
+                segs.append(s)
+    out = {"tmdb": [], "imdb": [], "tvdb": [], "bare": [], "names": []}
+    for s in segs:
+        tagged = set()
+        for rx, key in ((_RE_TMDB, "tmdb"), (_RE_TVDB, "tvdb")):
+            for m in rx.finditer(s):
+                tagged.add(m.span(1))
+                if _int(m.group(1)) and _int(m.group(1)) not in out[key]:
+                    out[key].append(_int(m.group(1)))
+        for m in _RE_IMDB.finditer(s):
+            v = _norm_imdb(m.group(1))
+            if v and v not in out["imdb"]:
+                out["imdb"].append(v)
+        bare = [m for m in _RE_BARE.finditer(s)
+                if m.span(1) not in tagged
+                and not (len(m.group(1)) == 4 and 1900 <= int(m.group(1)) <= 2099)]
+        if len(bare) == 1 and _int(bare[0].group(1)) not in out["bare"]:
+            out["bare"].append(_int(bare[0].group(1)))
+        # the segment as a name, minus the id tags, for title matching
+        name = _RE_TMDB.sub(" ", _RE_TVDB.sub(" ", _RE_IMDB.sub(" ", s)))
+        if len(bare) == 1:
+            name = name.replace(bare[0].group(1), " ")
+        name = re.sub(r"[\[\]{}()]", " ", name)
+        name = re.sub(r"\s+", " ", name).strip(" -_.")
+        if name and name not in out["names"]:
+            out["names"].append(name)
+    if not (out["tmdb"] or out["imdb"] or out["tvdb"] or out["bare"]):
+        return {}
+    return out
+
+
+def verify_path_ids(ids, titles, year, category, config, log=None):
+    """Check path id claims against TMDB; return the first that verifies.
+
+    Returns {"tmdb", "imdb", "tvdb", "category", "title", "year", "score",
+    "claim"} or None. Only TMDB is asked (no OMDb quota is spent).
+    """
+    log = log or (lambda _m: None)
+    if not ids:
+        return None
+    key = ((config or {}).get("DEFAULT", {}) or {}).get("tmdb_api") or ""
+    if not key:
+        return None
+    tmdb = _TMDB(key, log)
+    category = "MOVIE" if str(category).upper() == "MOVIE" else "TV"
+    other = "TV" if category == "MOVIE" else "MOVIE"
+    queries = []
+    for t in list(titles or []) + list(ids.get("names") or []):
+        t = re.sub(r"\s+", " ", str(t or "")).strip()
+        if t and t.lower() not in {q.lower() for q in queries}:
+            queries.append(t)
+
+    def _details(kind, tid):
+        seg = "movie" if kind == "MOVIE" else "tv"
+        try:
+            return tmdb._get(f"/{seg}/{tid}", language=TMDB_LANGUAGE,
+                             append_to_response="translations,external_ids")
+        except Exception as e:                                  # noqa: BLE001
+            log(f"path id {seg}/{tid}: {e}")
+            return None
+
+    def _check(kind, tid, claim, min_score=PATH_ID_MIN):
+        d = _details(kind, tid)
+        if not d or not d.get("id"):
+            return None
+        names = {d.get("title") or d.get("name") or "",
+                 d.get("original_title") or d.get("original_name") or ""}
+        for tr in ((d.get("translations") or {}).get("translations") or []):
+            data = tr.get("data") or {}
+            names.add(data.get("title") or data.get("name") or "")
+        names.discard("")
+        date = d.get("release_date") or d.get("first_air_date") or ""
+        cyear = _int(date[:4]) or None
+        best, best_pair = 0.0, ("", "")
+        for q in queries:
+            for n in names:
+                s = _score(q, year, n, cyear)
+                if s > best:
+                    best, best_pair = s, (q, n)
+        shown = d.get("title") or d.get("name") or ""
+        if best < min_score:
+            log(f"path id {claim} rejected: '{shown}' ({cyear}) best "
+                f"{best:.2f} vs {queries}")
+            return None
+        ext = d.get("external_ids") or {}
+        log(f"path id {claim} verified: '{shown}' ({cyear}) "
+            f"{best:.2f} ('{best_pair[0]}' ~ '{best_pair[1]}')")
+        return {"tmdb": _int(d.get("id")), "imdb": _norm_imdb(ext.get("imdb_id")),
+                "tvdb": _int(ext.get("tvdb_id")), "category": kind,
+                "title": shown, "year": cyear, "score": best, "claim": claim}
+
+    def _find(ext_id, source, claim, min_score=PATH_ID_MIN):
+        try:
+            res = tmdb._get(f"/find/{ext_id}", external_source=source)
+        except Exception as e:                                  # noqa: BLE001
+            log(f"path id {claim}: {e}")
+            return None
+        order = (("movie_results", "MOVIE"), ("tv_results", "TV"))
+        if category == "TV":
+            order = order[::-1]
+        for arr_key, kind in order:
+            for r in (res.get(arr_key) or [])[:1]:
+                v = _check(kind, r.get("id"), claim, min_score)
+                if v:
+                    return v
+        return None
+
+    for tid in ids.get("tmdb") or []:
+        for kind in (category, other):
+            v = _check(kind, tid, f"tmdb-{tid}")
+            if v:
+                return v
+    for imdb in ids.get("imdb") or []:
+        v = _find(imdb, "imdb_id", imdb)
+        if v:
+            return v
+    for tvdb in ids.get("tvdb") or []:
+        v = _find(tvdb, "tvdb_id", f"tvdb-{tvdb}")
+        if v:
+            return v
+    for n in ids.get("bare") or []:
+        v = _check(category, n, f"{n} (as tmdb)", PATH_BARE_MIN)
+        if v:
+            return v
+        v = _find(n, "tvdb_id", f"{n} (as tvdb)", PATH_BARE_MIN)
+        if v:
+            return v
+    return None
+
+
+def prefer_path_id(res, verified, log=None):
+    """Decide whether a verified path id replaces the resolver's answer.
+
+    The resolver always runs first, so everything it already gets right stays
+    exactly as it was (MAL id included). The path id only steps in when the
+    resolver did not reach 'high' on that same id, and never over a stored
+    human decision. Returns the replacement result, or None to keep `res`.
+    """
+    log = log or (lambda _m: None)
+    if not verified or not verified.get("tmdb"):
+        return None
+    if res.get("source") == "override":
+        return None
+    if (res.get("confidence") == "high"
+            and _int(res.get("tmdb")) == verified["tmdb"]
+            and res.get("category") == verified["category"]):
+        return None
+    log(f"path id {verified['claim']} replaces resolver "
+        f"{res.get('confidence')} tmdb={res.get('tmdb')}")
+    same = _int(res.get("tmdb")) == verified["tmdb"]
+    out = dict(res)
+    out.update(tmdb=verified["tmdb"],
+               imdb=verified["imdb"] or (res.get("imdb") if same else ""),
+               tvdb=verified["tvdb"] or (res.get("tvdb") if same else 0),
+               mal=res.get("mal") if same else 0,
+               category=verified["category"],
+               title=verified["title"] or res.get("title"),
+               year=verified["year"] or res.get("year"),
+               confidence="high", source="path",
+               path_claim=verified["claim"])
+    return out
+
+
+# ─── MyAnimeList, API oficial v2 (anime, con Client ID del usuario) ────────
+# Antes era Jikan, un espejo no oficial sin clave: el 15-10-2026 no aceptaba
+# conexiones y cada subida de anime se comía ~70 s de timeouts. El tracker ya
+# habla con la API oficial de MAL; aquí igual, con el Client ID que pone cada
+# usuario en DEFAULT -> mal_client_id. Sin él, MAL no se consulta y el anime
+# se resuelve con AniList.
+def _mal_client_id(defaults):
+    v = str((defaults or {}).get("mal_client_id") or "").strip()
+    if not v or v.upper() == "MAL_CLIENT_ID" or v.upper().startswith("YOUR_"):
+        return ""
+    return v
+
+
+def _mal_search(title, client_id, log):
     out = []
+    if not client_id:
+        return out
     try:
-        r = requests.get("https://api.jikan.moe/v4/anime",
-                          params={"q": title, "limit": 5, "sfw": "true"},
-                          timeout=TIMEOUT)
+        r = requests.get("https://api.myanimelist.net/v2/anime",
+                         params={"q": title[:64], "limit": 5,
+                                 "fields": "alternative_titles,start_date"},
+                         headers={"X-MAL-CLIENT-ID": client_id},
+                         timeout=TIMEOUT)
         r.raise_for_status()
         for hit in (r.json().get("data") or [])[:5]:
-            ttl = hit.get("title_english") or hit.get("title") or ""
-            alt = hit.get("title") or ""
-            yr = _int(hit.get("year")) or None
-            out.append(_cand("jikan", ttl, yr, "TV", mal=hit.get("mal_id"),
+            node = hit.get("node") or {}
+            alt_titles = node.get("alternative_titles") or {}
+            ttl = alt_titles.get("en") or node.get("title") or ""
+            alt = node.get("title") or ""
+            yr = _int(str(node.get("start_date") or "")[:4]) or None
+            out.append(_cand("mal", ttl, yr, "TV", mal=node.get("id"),
                              alt=alt))
     except Exception as e:                                      # noqa: BLE001
-        log(f"jikan search failed: {e}")
+        # Solo el tipo y el código: el texto de requests lleva la URL.
+        codigo = getattr(getattr(e, "response", None), "status_code", "")
+        log(f"mal search failed: {type(e).__name__} {codigo}".strip())
     return out
 
 
@@ -504,7 +725,7 @@ def resolve(title, year, category, config, aliases=None, mal_hint=False,
         config    : RawLoadrr config dict (reads DEFAULT.tmdb_api / imdb_api).
         aliases   : extra title candidates (e.g. folder-derived names).
         mal_hint  : True when the release looks like anime -> the anime
-                    providers (Jikan, AniList) are queried; otherwise they
+                    providers (MAL, AniList) are queried; otherwise they
                     are skipped so non-anime jobs are not spammed.
 
     Returns a dict:
@@ -536,6 +757,7 @@ def resolve(title, year, category, config, aliases=None, mal_hint=False,
     defaults = (config or {}).get("DEFAULT", {})
     tmdb_key = defaults.get("tmdb_api") or ""
     omdb_key = defaults.get("imdb_api") or ""
+    mal_key = _mal_client_id(defaults)
 
     tmdb = _TMDB(tmdb_key, log)
 
@@ -562,7 +784,7 @@ def resolve(title, year, category, config, aliases=None, mal_hint=False,
             cands += _omdb_search(omdb_key, q, year, cat, log)
             cands += _tvmaze_search(q, cat, log)
             if mal_hint:                       # anime providers, gated
-                cands += _jikan_search(q, log)
+                cands += _mal_search(q, mal_key, log)
                 cands += _anilist_search(q, log)
         return cands
 
@@ -639,7 +861,16 @@ def resolve(title, year, category, config, aliases=None, mal_hint=False,
     # listed as "Disaster: The Chernobyl Meltdown" on IMDB but "Chernobyl:
     # Inside the Meltdown" on TMDB). For each strong lead, ask every provider
     # DIRECTLY by IMDB id -- an exact-id hit is a real, unranked confirmation.
-    have_consensus = any(len(v) >= CONSENSUS_VOTES for v in imdb_votes.values())
+    # When an exact match exists, only consensus ON an exact match skips the
+    # by-id verification: two providers agreeing on a lesser candidate must
+    # not stop the exact one from collecting its own confirmations (Les
+    # Luthiers 2026-10-09: 2 votes at 0.93 beat a lone 1.00). Without an
+    # exact match this is the same test as before.
+    _exact = {k for k in imdb_votes
+              if pool.get(k, {}).get("score", 0.0) >= EXACT_SCORE}
+    have_consensus = any(len(v) >= CONSENSUS_VOTES
+                         for k, v in imdb_votes.items()
+                         if not _exact or k in _exact)
     if not have_consensus:
         leads = sorted({c["imdb"] for c in valid
                         if c["imdb"] and c["score"] >= STRONG_LEAD},
@@ -674,6 +905,7 @@ def resolve(title, year, category, config, aliases=None, mal_hint=False,
                     _pool(imdb, rec, lead_score)
 
     imdb_n = 0
+    exact_tie = False
     if imdb_votes:
         # Votes used to be the primary key here, with the score only breaking
         # ties. That let a weak-but-popular candidate beat a near-perfect one:
@@ -684,13 +916,23 @@ def resolve(title, year, category, config, aliases=None, mal_hint=False,
         # Score is now a filter: only candidates within SCORE_MARGIN of the
         # best score may compete, and votes decide among those. Consensus
         # still corrects a fuzzy-title mismatch between two plausible
-        # candidates, but it can no longer overrule an exact match.
+        # candidates. The margin alone did NOT protect an exact match (2 votes
+        # at 0.93 sit inside it), so an exact match now competes only with
+        # other exact matches; below EXACT_SCORE the margin rule is unchanged.
         best_score = max(pool[k]["score"] for k in imdb_votes)
-        contenders = [k for k in imdb_votes
-                      if pool[k]["score"] >= best_score - SCORE_MARGIN]
+        if best_score >= EXACT_SCORE:
+            contenders = [k for k in imdb_votes
+                          if pool[k]["score"] >= EXACT_SCORE]
+        else:
+            contenders = [k for k in imdb_votes
+                          if pool[k]["score"] >= best_score - SCORE_MARGIN]
         winner = max(contenders,
                      key=lambda k: (len(imdb_votes[k]), pool[k]["score"]))
         imdb_n = len(imdb_votes[winner])
+        # two different exact matches with the same votes: no way to choose
+        # between them, so this must not be reported as 'high'
+        exact_tie = best_score >= EXACT_SCORE and sum(
+            1 for k in contenders if len(imdb_votes[k]) == imdb_n) > 1
         merged = pool[winner]
         result.update(imdb=winner, tmdb=merged["tmdb"], tvdb=merged["tvdb"],
                       title=merged["title"] or title,
@@ -718,7 +960,10 @@ def resolve(title, year, category, config, aliases=None, mal_hint=False,
 
     # ── overall confidence: best of the two consensus tracks ──
     best_n = max(imdb_n, mal_n)
-    if best_n >= CONSENSUS_VOTES:
+    if exact_tie and imdb_n >= mal_n:
+        log(f"exact-match tie between different ids for '{title}' -> low")
+        result["confidence"] = "low"
+    elif best_n >= CONSENSUS_VOTES:
         result["confidence"] = "high"
     elif best_n == 1:
         result["confidence"] = "low"

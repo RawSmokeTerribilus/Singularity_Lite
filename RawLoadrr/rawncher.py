@@ -31,6 +31,7 @@ from core.status_manager import update_status
 from src.console import console
 from src.placeholders import es_placeholder, falta_por_preguntar
 from rich.prompt import Prompt, Confirm
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.rule import Rule
@@ -53,6 +54,19 @@ if GOD_PHRASES:
 
     console.print = troll_print  # type: ignore[method-assign]
 # ------------------------------------
+
+def _oculto(valor: str) -> str:
+    """Un secreto para enseñarlo: cuántos caracteres y los 4 últimos.
+
+    En una URL (la announce lleva la passkey), el host y los 4 últimos.
+    """
+    if not valor:
+        return "[dim]vacío[/dim]"
+    if valor.startswith(("http://", "https://")):
+        host = valor.split("/")[2] if valor.count("/") >= 2 else ""
+        return f"{valor.split('//')[0]}//{host}/…{valor[-4:]}"
+    return f"…{valor[-4:]} ({len(valor)} caracteres)" if len(valor) > 8 else f"({len(valor)} caracteres)"
+
 
 class Rawncher:
     """Lanzador principal de RawLoadrr"""
@@ -90,6 +104,8 @@ class Rawncher:
                 "google_books_api":   ("GOOGLE_BOOKS_API", "console.cloud.google.com — identifica e-books y audiolibros"),
                 "igdb_client_id":     ("TWITCH_CLIENT_ID", "dev.twitch.tv/console — IGDB va detrás de una app de Twitch"),
                 "igdb_client_secret": ("TWITCH_CLIENT_SECRET", "la misma app de Twitch que el id"),
+                "mal_client_id":      ("MAL_CLIENT_ID", "myanimelist.net/apiconfig — Client ID de una app tuya; "
+                                                        "identifica anime (sin ella, solo AniList)"),
             }
             needs_save = False
             default_config = self.config.get("DEFAULT", {})
@@ -128,11 +144,13 @@ class Rawncher:
                     if not obligatoria:
                         msg += "[dim] (Enter para dejarla vacía; no se vuelve a preguntar)[/dim]"
 
-                    new_val = Prompt.ask(msg)
+                    new_val = Prompt.ask(msg, password=True)
 
                     if "DEFAULT" not in self.config:
                         self.config["DEFAULT"] = {}
 
+                    if new_val.strip():
+                        console.print(f"[dim]  recibida: {_oculto(new_val.strip())}[/dim]")
                     # Se escribe clave a clave y en sitio. `_guardar_config()`
                     # regeneraría config.py entero desde pformat() y se llevaría
                     # por delante los comentarios del usuario --en el config de
@@ -167,59 +185,120 @@ class Rawncher:
                 self._reload_config()  # Recargamos para que todo esté fresco
 
         # ── ADUANA: Enlace con Cliente Torrent ────────────────────────────── #
-        console.print(Rule("[bold yellow]⚙  ADUANA — Enlace qBittorrent[/bold yellow]", style="yellow"))
+        # Se respeta el cliente de default_torrent_client. Antes la aduana solo
+        # conocía qBittorrent y, sin él, el lanzador forzaba --no-seed aunque
+        # config.py tuviera Deluge, Transmission, rTorrent o una carpeta watch,
+        # que upload.py (clients.py) sí sabe usar. Prueba fresca 15-10-2026.
+        self.cliente_externo = None
+        nombre_cliente = (self.config.get('DEFAULT', {}) or {}).get('default_torrent_client') or 'qbit'
+        celda_cliente = (self.config.get('TORRENT_CLIENTS', {}) or {}).get(nombre_cliente, {}) or {}
+        tipo_cliente = ('none' if nombre_cliente == 'none'
+                        else str(celda_cliente.get('torrent_client', nombre_cliente)).lower())
 
-        # --- 2. CARGA Y RECON DE CONFIG (qBit) ---
-        qbit_data = self.config.get("qbit", {})
-        
-        # Si las credenciales son las de serie o falta la URL, lanzamos la interfaz Rich
-        if not qbit_data or qbit_data.get("qbit_user") == "YOUR_USERNAME" or not qbit_data.get("qbit_url"):
-            self._logger.warning("ACR: Credenciales qBit por defecto o ausentes. Iniciando interceptación.")
-            
-            console.print(Panel("[bold yellow]🛠️ CONFIGURACIÓN DE ADUANA: qBittorrent[/]", expand=False))
-            console.print("[dim]Si qBit está en un contenedor Docker, usa la IP del host (ej: [bold]172.17.0.1[/bold]), no 'localhost'.[/dim]")
-            
-            host = Prompt.ask("URL del Cliente", default=qbit_data.get('qbit_url', 'http://172.17.0.1'))
-            port = Prompt.ask("Puerto", default=str(qbit_data.get('qbit_port', '8888')))
-            user = Prompt.ask("Usuario qBit", default=qbit_data.get('qbit_user', '').replace('YOUR_USERNAME', ''))
-            pwd  = Prompt.ask("Contraseña qBit", password=True)
+        qbit_fresco = (self.config.get('qbit', {}) or {}).get('qbit_user') in (None, '', 'YOUR_USERNAME')
+        if tipo_cliente == 'qbit' and qbit_fresco:
+            console.print(Rule("[bold yellow]⚙  ADUANA — Cliente torrent[/bold yellow]", style="yellow"))
+            console.print("[dim]Para sembrar lo que subes, Singularity añade cada torrent a tu cliente. Aquí se "
+                          "configura qBittorrent; Deluge, Transmission, rTorrent o una carpeta watch se ponen a "
+                          "mano en data/config.py (TORRENT_CLIENTS, y DEFAULT → default_torrent_client).[/dim]")
+            if not Confirm.ask("¿Usas qBittorrent?", default=True):
+                if self._persistir_clave_default('default_torrent_client', 'none'):
+                    self._reload_config()
+                else:
+                    self.config.setdefault('DEFAULT', {})['default_torrent_client'] = 'none'
+                    console.print("[bold yellow]  ⚠ No se pudo escribir en data/config.py; vale para esta sesión.[/bold yellow]")
+                nombre_cliente = tipo_cliente = 'none'
 
-            if "qbit" not in self.config: self.config["qbit"] = {}
-            self.config["qbit"].update({
-                "qbit_url": host.strip(),
-                "qbit_port": str(port).strip(),
-                "qbit_user": user.strip(),
-                "qbit_pass": pwd.strip(),
-                "enable_search": True
-            })
+        if tipo_cliente == 'none':
+            console.print(Panel("[yellow]Sin cliente torrent (default_torrent_client = 'none'): se sube sin sembrar "
+                                "(--no-seed).[/yellow]", title="[bold yellow]ADUANA — Cliente torrent[/]"))
+        elif tipo_cliente != 'qbit':
+            self.cliente_externo = tipo_cliente
+            self._logger.info(f"Aduana: cliente '{nombre_cliente}' ({tipo_cliente}); lo usa upload.py, no se comprueba aquí.")
+            console.print(Panel(f"Cliente configurado: [bold]{nombre_cliente}[/bold] ({tipo_cliente}). upload.py le "
+                                f"añade los torrents; la aduana solo comprueba qBittorrent.",
+                                title="[bold cyan]ADUANA — Cliente torrent[/]"))
+        else:
+            console.print(Rule("[bold yellow]⚙  ADUANA — Enlace qBittorrent[/bold yellow]", style="yellow"))
 
-            self._guardar_config()
-            console.print("[bold green]✅ Configuración de qBittorrent persistida con éxito.[/]")
-            self._reload_config()
+            # --- 2. CARGA Y RECON DE CONFIG (qBit) ---
+            qbit_data = self.config.get("qbit", {})
 
-        # --- 3. VALIDACIÓN DE ENLACE (Handshake) ---
-        try:
-            cfg = self.config["qbit"]
-            base_url = cfg["qbit_url"].rstrip('/')
-            
-            self._logger.info(f"Aduana: Intentando handshake con {base_url}:{cfg['qbit_port']}")
-            
-            self.client = qbit_api.Client(
-                host=base_url,
-                port=int(cfg["qbit_port"]),
-                username=cfg["qbit_user"],
-                password=cfg["qbit_pass"],
-                VERIFY_WEBUI_CERTIFICATE=cfg.get("VERIFY_WEBUI_CERTIFICATE", False),
-                REQUESTS_ARGS={'timeout': 10}
-            )
-            self.client.auth_log_in()
-            self._logger.info(f"Aduana: Online (v{self.client.app.version}). Conectado a qBittorrent.")
-            
-        except Exception as e:
-            self._logger.error(f"Aduana: Error de enlace qBit ({e}). Modo 'Solo Local' activado.")
-            self.client = None
-            console.print(Panel(f"[yellow]No se pudo conectar a qBittorrent. El script funcionará en [bold]modo solo local[/bold], guardando los torrents en una carpeta 'watch'.\nCausa: [dim]{e}[/dim]", 
-                                title="[bold yellow]⚠️ Conexión qBit fallida[/]"))
+            # Si las credenciales son las de serie o falta la URL, lanzamos la interfaz Rich
+            if not qbit_data or qbit_data.get("qbit_user") == "YOUR_USERNAME" or not qbit_data.get("qbit_url"):
+                self._logger.warning("ACR: Credenciales qBit por defecto o ausentes. Iniciando interceptación.")
+
+                console.print(Panel("[bold yellow]🛠️ CONFIGURACIÓN DE ADUANA: qBittorrent[/]", expand=False))
+                console.print("[dim]URL de la WebUI de qBit, ej: [bold]http://127.0.0.1[/bold] (con el compose oficial, "
+                              "network_mode: host, es 127.0.0.1). Si Singularity va en red bridge, la IP del host "
+                              "(ej: 172.17.0.1). El puerto puede ir en la URL o aparte.[/dim]")
+
+                # En una instalación fresca los valores de la plantilla no son del
+                # usuario: no se ofrecen como respuesta por defecto (un Enter en
+                # «Puerto» metía el 8888 de ejemplo aunque la URL llevara otro).
+                fresca = qbit_data.get("qbit_user") in (None, "", "YOUR_USERNAME")
+                url_def, port_def = self._url_y_puerto(qbit_data.get('qbit_url', ''),
+                                                       qbit_data.get('qbit_port', ''))
+                host = Prompt.ask("URL del Cliente", default=None if fresca else (url_def or None)) or ""
+                host, port_url = self._url_y_puerto(host, "")
+                if port_url:
+                    port = port_url
+                    console.print(f"[dim]Puerto tomado de la URL: {port}[/dim]")
+                else:
+                    port = Prompt.ask("Puerto", default=None if fresca else (port_def or None)) or ""
+                user = Prompt.ask("Usuario qBit", default=qbit_data.get('qbit_user', '').replace('YOUR_USERNAME', ''))
+                pwd  = Prompt.ask("Contraseña qBit", password=True)
+
+                if "qbit" not in self.config: self.config["qbit"] = {}
+                self.config["qbit"].update({
+                    "qbit_url": host.strip(),
+                    "qbit_port": str(port).strip(),
+                    "qbit_user": user.strip(),
+                    "qbit_pass": pwd.strip(),
+                    "enable_search": True
+                })
+                # La subida (clients.py) no lee este bloque sino
+                # TORRENT_CLIENTS[default_torrent_client]: en una instalación
+                # nueva se quedaba con los de plantilla (8080, USERNAME) y no
+                # podía añadir el torrent al cliente (prueba fresca rc2). Igual
+                # que torrent_storage_dir más abajo, se escribe en los dos.
+                self.config.setdefault("TORRENT_CLIENTS", {}).setdefault(nombre_cliente, {}).update({
+                    "torrent_client": "qbit",
+                    "qbit_url": host.strip(),
+                    "qbit_port": str(port).strip(),
+                    "qbit_user": user.strip(),
+                    "qbit_pass": pwd.strip(),
+                })
+
+                self._guardar_config()
+                console.print("[bold green]✅ Configuración de qBittorrent persistida con éxito.[/]")
+                self._reload_config()
+
+            # --- 3. VALIDACIÓN DE ENLACE (Handshake) ---
+            try:
+                cfg = self.config["qbit"]
+                # Si la URL ya trae puerto, qbittorrentapi usa ese e ignora port=:
+                # el log tiene que decir el que se usa de verdad.
+                base_url, eff_port = self._url_y_puerto(cfg["qbit_url"], cfg["qbit_port"])
+
+                self._logger.info(f"Aduana: Intentando handshake con {base_url}:{eff_port}")
+
+                self.client = qbit_api.Client(
+                    host=base_url,
+                    port=int(eff_port),
+                    username=cfg["qbit_user"],
+                    password=cfg["qbit_pass"],
+                    VERIFY_WEBUI_CERTIFICATE=cfg.get("VERIFY_WEBUI_CERTIFICATE", False),
+                    REQUESTS_ARGS={'timeout': 10}
+                )
+                self.client.auth_log_in()
+                self._logger.info(f"Aduana: Online ({self.client.app.version}). Conectado a qBittorrent.")
+
+            except Exception as e:
+                self._logger.error(f"Aduana: Error de enlace qBit ({e}). Modo 'Solo Local' activado.")
+                self.client = None
+                console.print(Panel(f"[yellow]No se pudo conectar a qBittorrent. El script funcionará en [bold]modo solo local[/bold], guardando los torrents en una carpeta 'watch'.\nCausa: [dim]{e}[/dim]", 
+                                    title="[bold yellow]⚠️ Conexión qBit fallida[/]"))
 
         # ── ADUANA: BT_backup / torrent_storage_dir ───────────────────────── #
         # CSI v3.4 (cosmetic fix 2026-05-23): the upload-side `clients.py`
@@ -242,7 +321,8 @@ class Rawncher:
         # actually exists on disk. Mismatch between the two also forces the
         # prompt so we resync them.
         candidate = upload_path or legacy_path
-        needs_prompt = (
+        # Sin cliente no hay BT_backup que reutilizar: no se pregunta.
+        needs_prompt = tipo_cliente != 'none' and (
             not candidate
             or not Path(candidate).exists()
             or (legacy_path and upload_path and legacy_path != upload_path)
@@ -287,6 +367,10 @@ class Rawncher:
         self.watch_folder.mkdir(parents=True, exist_ok=True)
 
     # <--- AQUÍ TERMINA EL __INIT__ (Alineado con el def de arriba)
+    def _sin_cliente(self) -> bool:
+        """Ni qBit conectado ni otro cliente configurado: toca --no-seed."""
+        return self.client is None and not getattr(self, 'cliente_externo', None)
+
     def disparar(self, torrent_path):
         """Lógica de ejecución: API o Local"""
         path_obj = Path(torrent_path)
@@ -385,7 +469,10 @@ class Rawncher:
             "  [bold cyan][6][/bold cyan]  Cargar sesión guardada\n"
             "  [bold cyan][0][/bold cyan]  Salir\n"
         )
-        qbit_status = "[bold green]qBit: Online ✅[/bold green]" if self.client else "[bold red]qBit: Offline ❌[/bold red]"
+        if self.cliente_externo:
+            qbit_status = f"[bold cyan]Cliente: {self.cliente_externo} (upload.py)[/bold cyan]"
+        else:
+            qbit_status = "[bold green]qBit: Online ✅[/bold green]" if self.client else "[bold red]qBit: Offline ❌[/bold red]"
         console.print(
             Panel(
                 menu_text,
@@ -817,7 +904,7 @@ class Rawncher:
 
         # LÓGICA DE CONTINGENCIA: Si el cliente está caído, no intentes añadir el torrent.
         # El .torrent generado se quedará en su carpeta tmp/<uuid>/
-        if self.client is None and '--no-seed' not in cmd:
+        if self._sin_cliente() and '--no-seed' not in cmd:
             cmd.append('--no-seed')
             console.print("[bold yellow]⚠️  INFO: Cliente torrent no disponible. Se activará --no-seed automáticamente.[/bold yellow]")
 
@@ -829,7 +916,7 @@ class Rawncher:
         console.print()
         console.print(
             Panel(
-                f"[bold yellow]{cmd_str}[/bold yellow]",
+                f"[bold yellow]{escape(cmd_str)}[/bold yellow]",
                 title="[bold]Comando a ejecutar[/bold]",
                 border_style="yellow",
             )
@@ -865,7 +952,7 @@ class Rawncher:
         cmd = ["python3", "auto-upload.py", "--list", str(ruta.resolve()), "--tracker", tracker]
 
         # LÓGICA DE CONTINGENCIA
-        if self.client is None and '--no-seed' not in cmd:
+        if self._sin_cliente() and '--no-seed' not in cmd:
             cmd.append('--no-seed')
             console.print("[bold yellow]⚠️  INFO: Cliente torrent no disponible. Se activará --no-seed automáticamente.[/bold yellow]")
 
@@ -877,7 +964,7 @@ class Rawncher:
         console.print()
         console.print(
             Panel(
-                f"[bold yellow]{cmd_str}[/bold yellow]",
+                f"[bold yellow]{escape(cmd_str)}[/bold yellow]",
                 title="[bold]Comando a ejecutar[/bold]",
                 border_style="yellow",
             )
@@ -977,7 +1064,7 @@ class Rawncher:
                             style="yellow"))
         cmd = ["python3", "auto-upload.py", "--list", str(tmp_list),
                "--tracker", tracker]
-        if self.client is None:
+        if self._sin_cliente():
             cmd.append('--no-seed')
         if Confirm.ask("[bold]¿Subir los releases resueltos ahora?[/bold]",
                        default=True):
@@ -1054,7 +1141,7 @@ class Rawncher:
             cmd = ["python3", "auto-upload.py", "--list", str(lista), "--tracker", tracker]
 
             # LÓGICA DE CONTINGENCIA
-            if self.client is None and '--no-seed' not in cmd:
+            if self._sin_cliente() and '--no-seed' not in cmd:
                 cmd.append('--no-seed')
 
             cmd_str = " ".join(cmd)
@@ -1071,7 +1158,7 @@ class Rawncher:
                 )
             )
             if Confirm.ask("[bold]¿Ejecutar?[/bold]", default=True):
-                if self.client is None:
+                if self._sin_cliente():
                     console.print("[bold yellow]⚠️  INFO: Cliente torrent no disponible. Se activará --no-seed automáticamente.[/bold yellow]")
                 self._ejecutar_comando(cmd)
                 console.print()
@@ -1212,6 +1299,20 @@ class Rawncher:
         """Recarga la configuración desde el archivo."""
         self.config = self._leer_config() or {}
 
+    @staticmethod
+    def _url_y_puerto(url, port):
+        """Separa «http://host:puerto» en ('http://host', 'puerto').
+
+        El puerto escrito en la URL manda sobre `port` (es lo que hace
+        qbittorrentapi). Sin puerto en la URL se devuelve `port` tal cual.
+        """
+        url = str(url or "").strip().rstrip('/')
+        port = str(port or "").strip()
+        m = re.match(r'^((?:[a-zA-Z][a-zA-Z0-9+.-]*://)?[^/:]+):(\d+)(/.*)?$', url)
+        if m:
+            return m.group(1) + (m.group(3) or ""), m.group(2)
+        return url, port
+
     def _guardar_config(self) -> None:
         """Guarda el diccionario de configuración actual en data/config.py."""
         config_path = self.base_dir / "data" / "config.py"
@@ -1300,18 +1401,14 @@ class Rawncher:
             tbl.add_column("Valor actual")
             tbl.add_column("Estado", justify="center")
 
-            api_display = (
-                f"{api_key[:8]}...{api_key[-4:]}"
-                if api_key and len(api_key) > 12
-                else api_key or "[dim]vacío[/dim]"
-            )
+            api_display = _oculto(api_key)
             tbl.add_row(
                 "api_key",
                 api_display,
                 "[green]✓[/green]" if api_ok else "[red]✗[/red]",
             )
 
-            announce_display = announce_url if announce_url else "[dim]vacío[/dim]"
+            announce_display = _oculto(announce_url)
             tbl.add_row(
                 "announce_url",
                 announce_display,
@@ -1333,7 +1430,8 @@ class Rawncher:
             console.print("[bold yellow]La API key no está configurada o es inválida.[/bold yellow]")
             while True:
                 nueva_key = Prompt.ask(
-                    f"[bold]API key para {tracker}[/bold] [dim](mín. 32 caracteres)[/dim]"
+                    f"[bold]API key para {tracker}[/bold] [dim](mín. 32 caracteres)[/dim]",
+                    password=True,
                 ).strip()
                 if len(nueva_key) < 32:
                     console.print(f"[bold red]❌ Demasiado corta ({len(nueva_key)} caracteres). Mínimo 32.[/bold red]")
@@ -1343,7 +1441,7 @@ class Rawncher:
                     continue
                 break
             if self._escribir_config_tracker(tracker, "api_key", nueva_key):
-                console.print("[bold green]✅ API key guardada.[/bold green]")
+                console.print(f"[bold green]✅ API key guardada:[/bold green] {_oculto(nueva_key)}")
                 self._reload_config()
 
         if not announce_ok:
@@ -1351,7 +1449,8 @@ class Rawncher:
             console.print("[bold yellow]La announce URL no está configurada o es inválida.[/bold yellow]")
             while True:
                 nueva_url = Prompt.ask(
-                    f"[bold]Announce URL para {tracker}[/bold] [dim](https://...)[/dim]"
+                    f"[bold]Announce URL para {tracker}[/bold] [dim](https://..., lleva tu passkey)[/dim]",
+                    password=True,
                 ).strip()
                 if not nueva_url.startswith("https://"):
                     console.print("[bold red]❌ Debe empezar por 'https://'.[/bold red]")
@@ -1361,7 +1460,7 @@ class Rawncher:
                     continue
                 break
             if self._escribir_config_tracker(tracker, "announce_url", nueva_url):
-                console.print("[bold green]✅ Announce URL guardada.[/bold green]")
+                console.print(f"[bold green]✅ Announce URL guardada:[/bold green] {_oculto(nueva_url)}")
                 self._reload_config()
 
         console.print()
@@ -1439,14 +1538,152 @@ class Rawncher:
     #  Opción 3 — Crear nuevo tracker                                     #
     # ------------------------------------------------------------------ #
 
+    def _ids_unit3d(self, base_url: str, api_key: str):
+        """Ids de categorías, tipos y resoluciones para un tracker nuevo.
+
+        Con la API key: se confirma que es UNIT3D y se leen los ids de sus
+        torrents. Si falta alguno, cookie de sesión opcional para leer la página
+        de subida (los tiene todos). Lo que siga faltando se pregunta, con los
+        ids por defecto de UNIT3D como sugerencia. Devuelve (categorias, tipos,
+        resoluciones, otra) o None si no es un UNIT3D: la plantilla sube por la
+        API de UNIT3D y con otro tracker no serviría.
+        """
+        from src import unit3d_ids as u
+
+        console.print()
+        console.print(Rule("[bold cyan]▸  Ids del tracker: categorías, tipos y resoluciones[/bold cyan]", style="cyan"))
+        console.print()
+        estado, detalle = u.detectar(base_url, api_key)
+        vistos = {}
+        if estado == "unit3d":
+            console.print("  [bold green]✓ UNIT3D detectado[/bold green] (su API contesta). Leyendo ids de sus torrents...")
+            vistos = u.ids_desde_api(base_url, api_key)
+        else:
+            motivo = {
+                "sin_clave": "la API pide clave y aún no hay API key",
+                "clave_mala": "la API rechaza la API key",
+                "caido": "no se pudo conectar",
+                "cloudflare": "Cloudflare frena la petición (desafío anti-bots; reintenta en un rato o configura Tor)",
+                "no": "no contesta como un UNIT3D",
+            }[estado]
+            console.print(f"  [bold yellow]⚠️  No se pudo confirmar que sea UNIT3D: {motivo} ({escape(detalle)}).[/bold yellow]")
+            if not Confirm.ask("  ¿Es un tracker UNIT3D?", default=estado != "no"):
+                console.print(
+                    Panel(
+                        "  «Crear nuevo tracker» solo genera módulos para UNIT3D: la plantilla sube\n"
+                        "  por su API (/api/torrents/upload). Otro tipo de tracker necesita un módulo propio.",
+                        border_style="red",
+                    )
+                )
+                return None
+
+        def _faltan(cats, tipos, res, otra):
+            return ([k for k in u.CLAVES_CATEGORIA if k not in cats]
+                    + [k for k in u.CLAVES_TIPO if k not in tipos]
+                    + [k for k in u.CLAVES_RESOLUCION if k not in res]
+                    + ([] if otra else ["Other"]))
+
+        cats, tipos, res, otra, sin_asignar = u.proponer(vistos)
+        faltan = _faltan(cats, tipos, res, otra)
+        if faltan:
+            if vistos:
+                console.print(f"  Faltan {len(faltan)} ids: la API solo enseña los que tienen torrents.")
+            console.print(
+                "  La página de subida de la web los tiene todos. Para leerla hace falta tu cookie de sesión:\n"
+                f"  [dim]navegador, en una pestaña de [bold]{escape(base_url)}[/bold] con la sesión iniciada → F12 → Red →\n"
+                "  recarga la página → la primera petición → Cabeceras de la petición → «Cookie» →\n"
+                "  copia la cabecera ENTERA: va como «nombre=valor; nombre=valor» (no vale un valor suelto\n"
+                "  de Almacenamiento → Cookies). Solo se usa para esta lectura; no se guarda.[/dim]"
+            )
+            intentar = Confirm.ask("  ¿Pegar la cookie?", default=False)
+            while intentar:
+                cookie = Prompt.ask("  Cookie", password=True).strip()
+                web, error = u.ids_desde_web(base_url, cookie) if cookie else (None, "vacía")
+                if web:
+                    vistos = web
+                    cats, tipos, res, otra, sin_asignar = u.proponer(web)
+                    console.print("  [bold green]✓ Lista completa leída de la página de subida.[/bold green]")
+                    break
+                console.print(f"  [bold yellow]⚠️  No se pudo leer la web: {escape(error)}.[/bold yellow]")
+                # Casi todo el mundo la copia mal la primera vez (prueba rc3:
+                # el valor suelto de la sesión): se deja repetir sin rehacer [3].
+                intentar = Confirm.ask("  ¿Probar otra vez con la cookie?", default=True)
+
+        def _pedir_id(etiqueta: str, sugerido: str) -> Optional[str]:
+            while True:
+                val = Prompt.ask(f"    id de {etiqueta}", default=sugerido or "").strip()
+                if val in ("", "-"):
+                    return None
+                if val.isdigit():
+                    return val
+                console.print("    [red]Solo números («-» = el tracker no la tiene).[/red]")
+
+        if sin_asignar:
+            console.print(f"  Categorías del tracker que no casan con ninguna clave: [bold]{escape(', '.join(sin_asignar))}[/bold]")
+        cats_faltan = [k for k in u.CLAVES_CATEGORIA if k not in cats]
+        if cats_faltan:
+            console.print("  Categorías sin id [dim](Enter acepta la sugerencia; «-» = el tracker no la tiene)[/dim]:")
+            for k in cats_faltan:
+                val = _pedir_id(f"{k} ({u.DESCRIPCION[k]})", u.SEMILLA_CATEGORIA.get(k, ""))
+                if val:
+                    cats[k] = val
+        if any(k not in tipos for k in u.CLAVES_TIPO) or any(k not in res for k in u.CLAVES_RESOLUCION) or not otra:
+            if Confirm.ask("  Tipos y resoluciones que faltan: ¿usar los ids por defecto de UNIT3D?", default=True):
+                for k, v in u.SEMILLA_TIPO.items():
+                    tipos.setdefault(k, v)
+                for k, v in u.SEMILLA_RESOLUCION.items():
+                    res.setdefault(k, v)
+                otra = otra or u.SEMILLA_OTRA
+            else:
+                for k in u.CLAVES_TIPO:
+                    if k not in tipos:
+                        val = _pedir_id(f"tipo {k} ({u.DESCRIPCION[k]})", u.SEMILLA_TIPO[k])
+                        if val:
+                            tipos[k] = val
+                for k in u.CLAVES_RESOLUCION:
+                    if k not in res:
+                        val = _pedir_id(f"resolución {k}", u.SEMILLA_RESOLUCION[k])
+                        if val:
+                            res[k] = val
+                if not otra:
+                    otra = _pedir_id("resolución «Other»", u.SEMILLA_OTRA)
+
+        nombres = {"cat": vistos.get("categories", {}), "tipo": vistos.get("types", {}),
+                   "res": vistos.get("resolutions", {})}
+        while True:
+            tbl = Table(show_header=True, header_style="bold cyan", border_style="dim",
+                        title="[bold]Ids que llevará el módulo[/bold]")
+            tbl.add_column("Clave", style="bold")
+            tbl.add_column("id", justify="right")
+            tbl.add_column("En el tracker", style="dim")
+            for grupo, d, claves in (("cat", cats, u.CLAVES_CATEGORIA), ("tipo", tipos, u.CLAVES_TIPO),
+                                     ("res", res, u.CLAVES_RESOLUCION)):
+                for k, v in u.ordenado(d, claves).items():
+                    tbl.add_row(k, v, escape(nombres[grupo].get(v, "") or "(sugerido)"))
+                tbl.add_section()
+            tbl.add_row("Other", otra or "—", escape(nombres["res"].get(otra or "", "") or ("(sugerido)" if otra else "")))
+            console.print(tbl)
+            if Confirm.ask("  ¿Son correctos?", default=True):
+                return cats, tipos, res, otra
+            console.print("  [dim]Enter deja el valor; «-» lo quita.[/dim]")
+            for d, prefijo in ((cats, ""), (tipos, "tipo "), (res, "resolución ")):
+                for k in list(d):
+                    val = _pedir_id(f"{prefijo}{k}", d[k])
+                    if val:
+                        d[k] = val
+                    else:
+                        d.pop(k)
+            otra = _pedir_id("resolución «Other»", otra or "")
+
     def opcion_3_crear_tracker(self) -> None:
-        """Crea un nuevo tracker basado en la plantilla MILNU"""
+        """Crea un tracker UNIT3D nuevo desde la plantilla UNIT3D_TEMPLATE.py,
+        con los ids de categorías/tipos/resoluciones del propio tracker."""
         console.print()
         console.print(
             Panel(
                 "\n"
-                "  Crea un nuevo tracker usando [bold cyan]MILNU[/bold cyan] como plantilla.\n"
-                "  Se crearán los archivos necesarios y se configurará el sistema.\n",
+                "  Añade un tracker [bold cyan]UNIT3D[/bold cyan] desde la plantilla de la suite.\n"
+                "  Sus ids de categorías, tipos y resoluciones se leen del propio tracker.\n",
                 title="[bold cyan]Crear nuevo tracker[/bold cyan]",
                 border_style="cyan",
             )
@@ -1466,24 +1703,35 @@ class Rawncher:
                 "ptpimg_api": "PTPIMG_API_KEY",
                 "lensdump_api": "LENSDUMP_API_KEY",
                 "oeimg_api": "OEIMG_API_KEY",
+                "mal_client_id": "MAL_CLIENT_ID",
             }
             default_config = self.config.get("DEFAULT", {})
             for python_key, env_key in master_keys.items():
                 val = default_config.get(python_key, "")
                 
-                # Heurística mejorada para detectar cualquier placeholder
-                if not val or val.startswith("YOUR_") or val in ["tu_clave_tmdb_aqui", "CAMBIAME"]:
+                # Mismo criterio que la aduana de arranque (src/placeholders.py):
+                # una opcional dejada en blanco es una respuesta, no un hueco.
+                # Antes [3] volvía a pedir PTPIMG/LENSDUMP en cada uso.
+                if "tmdb" in python_key:
+                    hay_hueco = es_placeholder(val, env_key, python_key)
+                else:
+                    hay_hueco = falta_por_preguntar(default_config, python_key, env_key, python_key)
+                if hay_hueco:
                     console.print(f"\n[bold red]✖ {env_key} no configurada.[/bold red]")
                     msg = f"[bold cyan]▶ Introduce el valor para {env_key}[/bold cyan]" + ("[dim] (Enter para saltar)[/dim]" if "tmdb" not in python_key else "")
-                    new_val = Prompt.ask(msg)
+                    new_val = Prompt.ask(msg, password=True)
                     
                     if new_val.strip():
+                        console.print(f"[dim]  recibida: {_oculto(new_val.strip())}[/dim]")
                         # Sincronización transversal usando el multiplexor
                         self._sync_global_secret(python_key, new_val.strip())
                         # Actualización en caliente de la config en memoria
                         if "DEFAULT" not in self.config:
                             self.config["DEFAULT"] = {}
                         self.config["DEFAULT"][python_key] = new_val.strip()
+                    elif "tmdb" not in python_key:
+                        # Como en el arranque: se guarda vacía y deja de preguntarse.
+                        self._persistir_clave_default(python_key, "")
         # ----------------------------------------------------
         nombre_completo = Prompt.ask(
             "[bold]Nombre completo del tracker[/bold] [dim](ej: MilNueve)[/dim]"
@@ -1492,6 +1740,7 @@ class Rawncher:
             console.print("[bold red]❌ El nombre no puede estar vacío.[/bold red]")
             return
 
+        solo_config = False
         while True:
             abrev_raw = Prompt.ask(
                 "[bold]Abreviación del tracker[/bold] [dim](ej: MILNU — se fuerza a mayúsculas)[/dim]"
@@ -1503,21 +1752,41 @@ class Rawncher:
             if not re.match(r'^[A-Z0-9]+$', abrev):
                 console.print("[bold red]❌ Solo letras mayúsculas y números.[/bold red]")
                 continue
+            # Un módulo que ya existe no se regenera: antes se machacaba en
+            # silencio (el NABS.py bueno acabó apuntando a milnueve).
+            if abrev in (self.config or {}).get("TRACKERS", {}):
+                console.print(f"[bold yellow]⚠️  '{abrev}' ya está en tu config.py: se configura con [2].[/bold yellow]")
+                if Confirm.ask(f"[bold]¿Ir a configurar '{abrev}'?[/bold]", default=True):
+                    self.opcion_2_configurar(preselected_tracker=abrev)
+                return
+            modulo_existente = self.base_dir / "src" / "trackers" / f"{abrev}.py"
+            if modulo_existente.exists():
+                solo_config = True
+                console.print(
+                    f"[bold green]✓ '{abrev}' es un tracker de la suite:[/bold green] su módulo no se toca; "
+                    "solo se añade a tu config.py."
+                )
+                break
             existentes = self._get_tracker_names_from_upload()
             if abrev in existentes:
                 console.print(f"[bold red]❌ '{abrev}' ya existe en upload.py. Elige otra.[/bold red]")
                 continue
             break
 
-        while True:
+        base_url = ""
+        if solo_config:
+            m = re.search(r"(https?://[^/'\"\s]+)/api/torrents/upload|BASE_URL = '(https?://[^']+)'",
+                          modulo_existente.read_text(encoding="utf-8"))
+            base_url = (m.group(1) or m.group(2)) if m else ""
+        while not base_url:
             base_url = Prompt.ask(
                 "[bold]URL base del tracker[/bold] [dim](ej: https://mitracker.ejemplo.es)[/dim]"
             ).strip()
             if not base_url.startswith("https://") and not base_url.startswith("http://"):
                 console.print("[bold red]❌ La URL debe empezar por https:// o http://[/bold red]")
+                base_url = ""
                 continue
             base_url = base_url.rstrip("/")
-            break
 
         console.print()
         console.print(Rule("[bold cyan]▸  RECON — Configuración Inicial[/bold cyan]", style="cyan"))
@@ -1528,6 +1797,7 @@ class Rawncher:
             val = Prompt.ask(
                 "  [bold]API Key[/bold] [dim](deja en blanco para configurar después)[/dim]",
                 default="",
+                password=True,
             ).strip()
             if val and (len(val) < 32 or "API_KEY" in val.upper()):
                 console.print("[bold red]❌ La API Key parece inválida (mínimo 32 caracteres).[/bold red]")
@@ -1538,8 +1808,9 @@ class Rawncher:
         announce_url_inicial = ""
         while True:
             val = Prompt.ask(
-                "  [bold]Announce URL[/bold] [dim](deja en blanco para configurar después)[/dim]",
+                "  [bold]Announce URL[/bold] [dim](deja en blanco para configurar después; lleva tu passkey)[/dim]",
                 default="",
+                password=True,
             ).strip()
             if val and (not val.startswith("https://") and not val.startswith("http://")):
                 console.print("[bold red]❌ La announce URL debe empezar por https:// o http://[/bold red]")
@@ -1548,18 +1819,25 @@ class Rawncher:
             break
 
         tracker_py = self.base_dir / "src" / "trackers" / f"{abrev}.py"
-        milnu_py = self.base_dir / "src" / "trackers" / "MILNU.py"
+        plantilla_py = self.base_dir / "src" / "trackers" / "UNIT3D_TEMPLATE.py"
         upload_py = self.base_dir / "upload.py"
         config_py = self.base_dir / "data" / "config.py"
 
         errores = []
 
-        if not milnu_py.exists():
-            console.print("[bold red]❌ No se encontró la plantilla MILNU.py[/bold red]")
-            return
+        ids = None
+        if not solo_config:
+            if not plantilla_py.exists():
+                console.print("[bold red]❌ No se encontró la plantilla UNIT3D_TEMPLATE.py[/bold red]")
+                return
+            ids = self._ids_unit3d(base_url, api_key_inicial)
+            if ids is None:
+                return
 
-        api_display = api_key_inicial[:8] + "..." if api_key_inicial else "[dim]pendiente[/dim]"
-        ann_display = announce_url_inicial if announce_url_inicial else "[dim]pendiente[/dim]"
+        api_display = _oculto(api_key_inicial) if api_key_inicial else "[dim]pendiente[/dim]"
+        ann_display = _oculto(announce_url_inicial) if announce_url_inicial else "[dim]pendiente[/dim]"
+        archivo = ("[dim]src/trackers/{0}.py (de la suite, no se toca)[/dim]" if solo_config
+                   else "[dim]src/trackers/{0}.py (nuevo, plantilla UNIT3D)[/dim]").format(abrev)
         console.print()
         console.print(
             Panel(
@@ -1568,7 +1846,7 @@ class Rawncher:
                 f"  URL base:     [bold]{base_url}[/bold]\n"
                 f"  API Key:      {api_display}\n"
                 f"  Announce URL: {ann_display}\n"
-                f"  Archivo:      [dim]src/trackers/{abrev}.py[/dim]",
+                f"  Archivo:      {archivo}",
                 title="[bold]Resumen de creación[/bold]",
                 border_style="blue",
             )
@@ -1578,32 +1856,39 @@ class Rawncher:
             console.print("[bold yellow]⚠️  Operación cancelada.[/bold yellow]")
             return
 
-        milnu_text = milnu_py.read_text(encoding="utf-8")
-        nuevo_text = milnu_text
-        nuevo_text = nuevo_text.replace(f"class MILNU(", f"class {abrev}(")
-        nuevo_text = nuevo_text.replace(f"self.tracker = 'MILNU'", f"self.tracker = '{abrev}'")
-        nuevo_text = nuevo_text.replace(
-            f"self.source_flag = 'Milnueve'",
-            f"self.source_flag = '{nombre_completo}'"
-        )
-        nuevo_text = nuevo_text.replace(
-            "https://milnueve.neklair.es/api/torrents/upload",
-            f"{base_url}/api/torrents/upload",
-        )
-        nuevo_text = nuevo_text.replace(
-            "https://milnueve.neklair.es/api/torrents/filter",
-            f"{base_url}/api/torrents/filter",
-        )
-        nuevo_text = re.sub(r'\bMILNU\b', abrev, nuevo_text)
-        nuevo_text = re.sub(r'\bMilnueve\b', nombre_completo, nuevo_text)
-        nuevo_text = re.sub(r'\bmilnu_name\b', f'{abrev.lower()}_name', nuevo_text)
+        if not solo_config:
+            from src.unit3d_ids import bloque_ids
+            nuevo_text = plantilla_py.read_text(encoding="utf-8")
+            try:
+                # Cada sustitución tiene que casar exactamente una vez: antes un
+                # replace que no casaba fallaba en silencio y el módulo nuevo
+                # salía apuntando a milnueve.
+                for viejo, nuevo in (
+                    ("class UNIT3D_TEMPLATE():", f"class {abrev}():"),
+                    ("self.tracker = 'UNIT3D_TEMPLATE'", f"self.tracker = '{abrev}'"),
+                    ("self.source_flag = 'UNIT3D_TEMPLATE'", f"self.source_flag = {nombre_completo!r}"),
+                    ("BASE_URL = 'https://tracker.example'", f"BASE_URL = {base_url!r}"),
+                ):
+                    if nuevo_text.count(viejo) != 1:
+                        raise ValueError(f"la plantilla no tiene «{viejo}» exactamente una vez")
+                    nuevo_text = nuevo_text.replace(viejo, nuevo)
+                ini = nuevo_text.index("\n", nuevo_text.index("    # >>> ids del tracker")) + 1
+                fin = nuevo_text.index("    # <<< ids del tracker")
+                nuevo_text = nuevo_text[:ini] + bloque_ids(*ids) + nuevo_text[fin:]
+                compile(nuevo_text, f"{abrev}.py", "exec")
+            except (ValueError, SyntaxError) as e:
+                console.print(f"[bold red]❌ No se pudo generar el módulo desde UNIT3D_TEMPLATE.py: {e}[/bold red]")
+                return
 
-        try:
-            tracker_py.write_text(nuevo_text, encoding="utf-8")
-            console.print(f"[bold green]✅ Creado:[/bold green] src/trackers/{abrev}.py")
-        except Exception as e:
-            console.print(f"[bold red]❌ No se pudo crear el archivo del tracker: {e}[/bold red]")
-            errores.append(f"tracker .py: {e}")
+            if tracker_py.exists():
+                console.print(f"[bold red]❌ src/trackers/{abrev}.py ya existe: no se sobrescribe.[/bold red]")
+                return
+            try:
+                tracker_py.write_text(nuevo_text, encoding="utf-8")
+                console.print(f"[bold green]✅ Creado:[/bold green] src/trackers/{abrev}.py")
+            except Exception as e:
+                console.print(f"[bold red]❌ No se pudo crear el archivo del tracker: {e}[/bold red]")
+                errores.append(f"tracker .py: {e}")
 
         cfg_api = api_key_inicial if api_key_inicial else f"{abrev}_API_KEY"
         cfg_announce = announce_url_inicial if announce_url_inicial else f"{base_url}/announce/Custom_Announce_URL"
@@ -1704,8 +1989,9 @@ class Rawncher:
         else:
             console.print(
                 Panel(
-                    f"  [bold green]✅[/bold green] src/trackers/{abrev}.py creado\n"
-                    f"  [bold green]✅[/bold green] data/config.py actualizado\n"
+                    (f"  [bold green]✅[/bold green] src/trackers/{abrev}.py de la suite (sin tocar)\n" if solo_config
+                     else f"  [bold green]✅[/bold green] src/trackers/{abrev}.py creado\n")
+                    + f"  [bold green]✅[/bold green] data/config.py actualizado\n"
                     f"  [bold green]✅[/bold green] trackers_registry.json actualizado\n",
                     title=f"[bold green]🚀 Tracker '{abrev}' creado con éxito[/bold green]",
                     border_style="green",
@@ -1866,9 +2152,7 @@ class Rawncher:
         tracker_name = session.get("name", "?")
         url = session.get("url", "?")
         api_key = session.get("api_key", "")
-        api_display = (
-            f"{api_key[:8]}..." if api_key and len(api_key) > 8 else api_key or "?"
-        )
+        api_display = _oculto(api_key)
         saved_at = session.get("saved_at", "?")
 
         summary = (
@@ -1893,5 +2177,6 @@ if __name__ == "__main__":
     try:
         Rawncher().run()
     except Exception:
-        console.print_exception(show_locals=True)
+        # Sin show_locals: las variables locales llevan api keys y passkeys.
+        console.print_exception(show_locals=False)
         sys.exit(1)

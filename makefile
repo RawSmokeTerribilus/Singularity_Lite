@@ -44,15 +44,9 @@ prep:
 	@mkdir -p work_data/qbit_backup
 	@mkdir -p $(WORK_TRACKERS)
 	@mkdir -p work_data/tmp/qbit_backup
-	@if [ -z "$$(ls -A $(WORK_TRACKERS) 2>/dev/null)" ]; then \
-		if [ -d "$(SCRIPTS_SRC)" ] && [ -n "$$(ls -A $(SCRIPTS_SRC) 2>/dev/null)" ]; then \
-			echo "🧬 Infundiendo trackers desde el source local..."; \
-			cp -rn $(SCRIPTS_SRC)/* $(WORK_TRACKERS)/; \
-		else \
-			echo "❌ No encuentro $(SCRIPTS_SRC). ¿Repo incompleto?"; \
-			exit 1; \
-		fi; \
-	fi
+	@# Antes solo sembraba si estaba vacío y los arreglos de los módulos no
+	@# llegaban nunca; la lógica (refrescar + fusionar registro) vive en el instalador.
+	@bash final-user-install.sh --solo-trackers
 	@mkdir -p config
 	@if [ ! -f .env ] && [ -f .env.example ]; then cp .env.example .env; echo "🧩 Creado ./.env (compose) desde plantilla — EDÍTALO: MEDIA_ROOT"; fi
 	@if [ ! -f config/.env ] && [ -f config/.env.example ]; then cp config/.env.example config/.env; echo "🧩 Creado config/.env (aplicación) desde plantilla"; fi

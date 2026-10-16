@@ -18,7 +18,8 @@ import sys
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parent
-INSTALADOR = RAIZ / "final-user-install.sh"
+# Lite tiene un solo instalador (no hay kit en linux-installer/ como en main).
+INSTALADORES = [RAIZ / "final-user-install.sh"]
 
 # clave embebida  →  fichero de plantilla que manda
 FUENTES = {
@@ -41,9 +42,16 @@ def _bloque(texto):
 
 def main():
     solo_comprobar = "--check" in sys.argv[1:]
+    codigo = 0
+    for instalador in INSTALADORES:
+        codigo = max(codigo, _sincronizar(instalador, solo_comprobar))
+    return codigo
 
+
+def _sincronizar(INSTALADOR, solo_comprobar):
+    nombre = INSTALADOR.relative_to(RAIZ)
     if not INSTALADOR.exists():
-        print(f"✗ no encuentro {INSTALADOR.name}")
+        print(f"✗ no encuentro {nombre}")
         return 1
 
     texto = INSTALADOR.read_text(encoding="utf-8")
@@ -75,16 +83,16 @@ def main():
             desfasadas.append(clave)
 
     if not desfasadas:
-        print("✓ las plantillas embebidas ya están al día")
+        print(f"✓ {nombre}: las plantillas embebidas ya están al día")
         return 0
 
     if solo_comprobar:
-        print("✗ plantillas embebidas desfasadas: " + ", ".join(desfasadas))
+        print(f"✗ {nombre}: plantillas embebidas desfasadas: " + ", ".join(desfasadas))
         print("  ejecuta: make sync-defaults")
         return 1
 
     INSTALADOR.write_text(texto[:ini] + nuevo + texto[fin:], encoding="utf-8")
-    print("✓ regeneradas en final-user-install.sh: " + ", ".join(desfasadas))
+    print(f"✓ regeneradas en {nombre}: " + ", ".join(desfasadas))
     return 0
 
 

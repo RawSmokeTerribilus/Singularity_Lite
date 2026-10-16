@@ -6,7 +6,10 @@ from src.id_resolver import (resolve as _resolve_ids,
                              save_override as _save_override,
                              save_kind as _save_kind,
                              load_kind as _load_kind,
-                             report_pending as _report_pending)
+                             report_pending as _report_pending,
+                             path_ids as _path_ids,
+                             verify_path_ids as _verify_path_ids,
+                             prefer_path_id as _prefer_path_id)
 from src.discparse import DiscParse
 from src.exceptions import ManualDateException, WeirdSystem, XEMNotFound
 from src.trackers.PTP import PTP
@@ -73,6 +76,7 @@ try:
     from pathlib import Path
     from pymediainfo import MediaInfo
     from rich.prompt import Prompt, Confirm
+    from rich.markup import escape
     from rich.progress import Progress, TextColumn, BarColumn, TimeRemainingColumn
     from rich.traceback import install, Traceback
     from requests.exceptions import HTTPError
@@ -271,6 +275,10 @@ class Prep():
             console.print('[red]Processing as video')
             meta['is_disc'], videoloc, bdinfo, meta['discs'] = await self.get_disc(meta)        
             
+            # Alias de carpeta para resolve_ids(): solo los rellena la rama de
+            # vídeo suelto, y un disco sin ids llegaba allí con NameError.
+            _parent = _grandparent = _titulo_fichero = ''
+
             # If BD:
             if meta['is_disc'] == "BDMV":
                 video, meta['scene'], meta['imdb'] = self.is_scene(meta['path'], meta.get('imdb', None))
@@ -365,8 +373,16 @@ class Prep():
                     ).get("title") or guess_name
                 except Exception:
                     filename = guess_name
-                _parent = re.sub(r'\s*[-_]?\s*(?<![a-zA-Z])(?:s|season|temporada|saison|staffel|stagione|seizoen|sezon|сезон|시즌|シーズン|季)\s*\d+\s*$', '', ntpath.basename(ntpath.dirname(video)), flags=re.IGNORECASE).strip()
+                _padre_crudo = ntpath.basename(ntpath.dirname(video)).strip()
+                _parent = re.sub(r'\s*[-_]?\s*(?<![a-zA-Z])(?:s|season|temporada|saison|staffel|stagione|seizoen|sezon|сезон|시즌|シーズン|季)\s*\d+\s*$', '', _padre_crudo, flags=re.IGNORECASE).strip()
                 _grandparent = re.sub(r'\s*\(\d{4}\)', '', ntpath.basename(ntpath.dirname(ntpath.dirname(video)))).strip()
+                # El abuelo solo es el título cuando el padre es una carpeta de
+                # temporada («Serie/Temporada 1/ep.mkv»). Si no, es la biblioteca
+                # («CINE-2», «ANIME», «NOBS»): como alias traía basura de tvmaze
+                # («Cunk on Cinema», prueba fresca rc2) y en el caso Logan llegó a
+                # dar un high falso («Cine de Emboscada»).
+                if _parent and _parent == _padre_crudo:
+                    _grandparent = ''
                 if filename and filename.lower() not in _parent.lower() and filename.lower() not in _grandparent.lower():
                     # La carpeta sustituye al título cuando es el MISMO título
                     # mejor puntuado («Mayans M.C.») o cuando guessit no sacó nada
@@ -377,7 +393,16 @@ class Prep():
                     _n = lambda s: re.sub(r"[\W_]+", " ", s.lower()).strip()
                     _p = _n(_plegar(_parent))
                     if not (_n(filename) and _n(filename) in _p and _n(filename) != _p):
+                        # El título del fichero no se tira: va de alias. En la
+                        # prueba rc2 la carpeta era el título original («Balle
+                        # perdue 3») y el fichero el inglés («Last Bullet»), que
+                        # es el que daba high a la primera.
+                        _titulo_fichero = filename
                         filename = _parent if _parent else _grandparent
+                        # Y la carpeta va limpia: «Balle perdue 3 () Spanish» no
+                        # lo encuentra nadie. Con reglas fijas, no con guessit,
+                        # que recorta títulos («The 4400» -> «The»).
+                        filename = self._limpiar_carpeta(filename) or filename
                 untouched_filename = os.path.basename(video)
                 try:
                     meta['search_year'] = guessit(video)['year']
@@ -522,7 +547,7 @@ class Prep():
             if meta.get('tmdb', None) is None and meta.get('imdb', None) is None:
                 meta['category'], meta['tmdb'], meta['imdb'] = self.get_tmdb_imdb_from_mediainfo(mi, meta['category'], meta['is_disc'], meta['tmdb'], meta['imdb'])      
             if meta.get('tmdb', None) is None and meta.get('imdb', None) is None:
-                meta = await self.resolve_ids(meta, filename, aliases=[_parent, _grandparent])
+                meta = await self.resolve_ids(meta, filename, aliases=[_titulo_fichero, _parent, _grandparent])
             elif meta.get('imdb', None) is not None and meta.get('tmdb_manual', None) is None:
                 meta['imdb_id'] = str(meta['imdb']).replace('tt', '')
                 meta = await self.get_tmdb_from_imdb(meta, filename)
@@ -2218,6 +2243,111 @@ class Prep():
     _FIRMAS_ENCODE = ('x264', 'x265', 'lavf', 'handbrake', 'svt-av1', 'svt av1',
                       'libaom', 'aomenc', 'ffmpeg', 'nvenc', 'vaapi', 'qsv')
 
+    # Firmas de un recodificado HECHO EN CASA (Tdarr, HandBrake, ffmpeg...). x264
+    # no está: los WEB-DL H.264 de Netflix traen ajustes de x264 de serie.
+    _FIRMAS_WEB_LOCAL = ('x265', 'lavc', 'vaapi', 'nvenc', 'qsv', 'handbrake', 'svt-av1',
+                         'svt av1', 'libaom', 'aomenc', 'ffmpeg')
+
+    @staticmethod
+    def _pistas_mi(mi):
+        try:
+            tracks = mi['media']['track']
+        except (KeyError, TypeError):
+            return {}, {}, [], []
+        de = lambda t: [x for x in tracks if x.get('@type') == t]
+        return (next(iter(de('General')), {}), next(iter(de('Video')), {}), de('Audio'), de('Text'))
+
+    def _recodificado_web(self, mi, nombre=''):
+        """¿Un fichero de origen web está recodificado? -> WEBRip, si no WEB-DL.
+
+        WEB-DL es el flujo del servicio sin tocar (como mucho remux); WEBRip,
+        cualquier codificación o recodificación desde fuente web, incluidos
+        los encodes de un WEB-DL (guía de subida de TorrentBD, web-dl-101).
+        Pruebas: firma de un encoder de consumo en la pista de vídeo o
+        HandBrake como aplicación; y HEVC <=1080p sin HDR, que los servicios
+        no sirven (dan 1080p SDR en H.264) y que es lo que deja Tdarr cuando
+        un mkvmerge posterior borra la etiqueta del encoder por hardware.
+        """
+        g, v, _, _ = self._pistas_mi(mi)
+        if not v:
+            return False
+        firma = ' '.join(str(v.get(k, '')) for k in ('Encoded_Library_Name', 'Encoded_Library')).lower()
+        if any(f in firma for f in self._FIRMAS_WEB_LOCAL):
+            return True
+        if 'handbrake' in str(g.get('Encoded_Application', '')).lower():
+            return True
+        if 'x264' in firma:
+            return False
+        # Con el servicio en el nombre (NF, AMZN...) es una release de scene:
+        # Netflix y Amazon sí sirven HEVC 1080p SDR, sin firma de x265
+        # (medido en NOBS: «Peaky Blinders 1080p NF WEB-DL H.265» a 2 Mb/s).
+        if self._SERVICIOS.search(nombre or '') or self._SERVICIOS.search(str(g.get('Title', ''))):
+            return False
+        try:
+            alto = int(v.get('Height') or 0)
+        except (TypeError, ValueError):
+            alto = 0
+        hdr = ' '.join(str(v.get(k, '')) for k in ('HDR_Format', 'HDR_Format_Compatibility')).strip()
+        return v.get('Format') == 'HEVC' and 0 < alto <= 1080 and not hdr
+
+    _SERVICIOS = re.compile(r'\b(amzn|amazon|nf|netflix|dsnp|disney\+?|hmax|hbo ?max|atvp|apple ?tv|pcok|'
+                            r'peacock|hulu|movistar|mtsp|skst|skyshowtime|rakuten|filmin|atresplayer|rtve|max(?=[ ._-]web))\b', re.I)
+
+    def _origen_por_mediainfo(self, mi):
+        """('BluRay'|'Web'|'DVD'|'HDTV'|None, razones) cuando el nombre no lo dice.
+
+        Lo que miraría un admin: subtítulos PGS, audio sin pérdida, DTS, DV
+        perfil 7 o VC-1/MPEG-2 en HD apuntan a disco; E-AC3, DV perfil 5,
+        subtítulos solo de texto o un servicio en las etiquetas, a web.
+        Antes, sin pista en el nombre, todo era «BluRay».
+        """
+        g, v, a, s = self._pistas_mi(mi)
+        if not v:
+            return None, ['sin mediainfo']
+        disco, web, razones = 0, 0, []
+        try:
+            alto = int(v.get('Height') or 0)
+        except (TypeError, ValueError):
+            alto = 0
+        vf = str(v.get('Format', ''))
+        hdr = ' '.join(str(v.get(k, '')) for k in ('HDR_Format', 'HDR_Format_Profile')).lower()
+        textos = ' '.join(str(g.get(k, '')) for k in ('Title', 'Movie', 'OriginalSourceMedium')) + ' ' + json.dumps(g.get('extra') or {})
+        if alto and alto <= 576 and (vf == 'MPEG Video' or v.get('Standard') in ('PAL', 'NTSC')):
+            return 'DVD', ['576/480 en MPEG-2 o PAL/NTSC']
+        escaneo = str(v.get('ScanType', '')).lower()
+        if ('interlaced' in escaneo or 'mbaff' in escaneo) and vf in ('MPEG Video', 'AVC') \
+                and not any(t.get('Format') == 'PGS' for t in s):
+            return 'HDTV', ['vídeo entrelazado']
+        if re.search(r'blu-?ray|bdmv|uhd ?bd', textos, re.I):
+            disco += 3; razones.append('etiqueta Blu-ray')
+        if self._SERVICIOS.search(textos):
+            web += 3; razones.append('servicio de streaming en las etiquetas')
+        if any(t.get('Format') == 'PGS' for t in s):
+            disco += 2; razones.append('subtítulos PGS')
+        elif s and all(t.get('Format') in ('UTF-8', 'WebVTT', 'TTML', 'Timed Text') for t in s):
+            web += 1; razones.append('subtítulos solo de texto')
+        sin_perdida = [t for t in a if t.get('Format') in ('MLP FBA', 'PCM', 'FLAC')
+                       or 'truehd' in str(t.get('Format_Commercial_IfAny', '')).lower()
+                       or 'master audio' in str(t.get('Format_Commercial_IfAny', '')).lower()
+                       or 'xll' in str(t.get('Format_AdditionalFeatures', '')).lower()]
+        if sin_perdida:
+            disco += 2; razones.append(f"audio sin pérdida ({sin_perdida[0].get('Format')})")
+        elif any('dts' in str(t.get('Format', '')).lower() for t in a):
+            disco += 1; razones.append('DTS')
+        if any(t.get('Format') == 'E-AC-3' for t in a):
+            web += 2; razones.append('E-AC3')
+        if 'profile 5' in hdr or 'dvhe.05' in hdr:
+            web += 2; razones.append('Dolby Vision perfil 5')
+        if 'profile 7' in hdr or 'dvhe.07' in hdr:
+            disco += 2; razones.append('Dolby Vision perfil 7')
+        if vf in ('VC-1', 'MPEG Video') and alto >= 720:
+            disco += 2; razones.append(f'{vf} en HD')
+        if disco >= web + 1:
+            return 'BluRay', razones
+        if web >= disco + 1:
+            return 'Web', razones
+        return None, razones or ['sin señales']
+
     def _remux_desmentido(self, mi, resolution):
         """
         ¿Mediainfo desmiente el «remux» que dice el nombre del fichero?
@@ -2295,14 +2425,33 @@ class Prep():
             dice_remux = False
         if dice_remux:
             type = "REMUX"
-        elif any(word in filename for word in [" web ", ".web.", "web-dl"]):
-            type = "WEBDL"
         elif "webrip" in filename:
             type = "WEBRIP"
+        # «WEBDL», sin guion, es como nombran Sonarr y Radarr: no se reconocía y
+        # el fichero acababa de ENCODE -> WEBRIP en get_source.
+        elif any(word in filename for word in [" web ", ".web.", "web-dl", "webdl", "web dl"]):
+            # El nombre dice de dónde viene, no si se ha tocado: un WEB-DL
+            # recodificado (Tdarr) es un WEBRip.
+            if self._recodificado_web(mi, os.path.basename(video)):
+                log.info(f"[get_type] '{os.path.basename(video)}' es de origen web pero está recodificado: WEBRIP")
+                type = "WEBRIP"
+            else:
+                type = "WEBDL"
         # elif scene:
             # type = "ENCODE"
         elif "hdtv" in filename:
             type = "HDTV"
+        elif "sdtv" in filename:
+            # «SDTV» es lo que pone Radarr/Sonarr cuando no sabe la calidad. Si
+            # el mediainfo dice otra cosa, manda él: «Shaolin Soccer SDTV DTS-HD
+            # MA» con subtítulos PGS es un encode de Blu-ray, no tele.
+            origen, _ = self._origen_por_mediainfo(mi)
+            if origen == 'Web':
+                type = "WEBRIP" if self._recodificado_web(mi, os.path.basename(video)) else "WEBDL"
+            elif origen in ('BluRay', 'DVD'):
+                type = "ENCODE"
+            else:
+                type = "HDTV"
         elif is_disc is not None:
             type = "DISC"
         else:
@@ -2827,6 +2976,25 @@ class Prep():
             meta['cover_rehosted'] = True
             console.print(f"[green]Portada rehosteada:[/green] [dim]{meta['cover_url']}[/dim]")
 
+    # Palabras que cuelgan al final del nombre de una carpeta y no son título.
+    _COLA_CARPETA = {'spanish', 'castellano', 'espanol', 'español', 'latino', 'english', 'ingles', 'inglés',
+                     'dual', 'multi', 'vose', 'vos', 'esp', 'cast', 'lat', 'subs', 'subtitulado'}
+
+    @classmethod
+    def _limpiar_carpeta(cls, nombre):
+        """«Balle perdue 3 () Spanish» -> «Balle perdue 3».
+
+        Quita corchetes, paréntesis vacíos o con año y las palabras de idioma
+        del final. No toca nada más: los títulos con números o subtítulos
+        («The 4400», «Dead Reckoning Part One») se quedan enteros.
+        """
+        s = re.sub(r"\[[^\]]*\]", " ", nombre or "")
+        s = re.sub(r"\(\s*(?:\d{4})?\s*\)", " ", s)
+        palabras = s.split()
+        while palabras and palabras[-1].strip(".-_").lower() in cls._COLA_CARPETA:
+            palabras.pop()
+        return " ".join(palabras).strip(" .-_")
+
     async def resolve_ids(self, meta, filename, aliases=None):
         """
         Identify the release by cross-referencing several metadata providers
@@ -2862,10 +3030,34 @@ class Prep():
                           f"falling back to TMDB search.")
             return await self.get_tmdb_id(filename, year, meta, category)
 
+        # Ids escritos en la ruta («[tmdb-79200] [tt34672616]», «Serie
+        # 2020-364928»): solo cuentan si TMDB devuelve un título que casa con
+        # el nombre, y solo sustituyen al resolver cuando éste NO llegó a
+        # «high» con ese mismo id. Si coinciden, todo sigue como estaba.
+        try:
+            _fl = meta.get('filelist') or []
+            _pid = _path_ids(_fl[0] if _fl else meta.get('path', ''),
+                             meta.get('path', ''))
+            if _pid:
+                _plog = lambda m: log.info(f"[id_resolver] {m}")
+                _alt = _prefer_path_id(
+                    res, _verify_path_ids(_pid, [filename], year, category,
+                                          self.config, log=_plog), log=_plog)
+                if _alt:
+                    console.print(f"[bold green]✓ ID de la ruta[/bold green] "
+                                  f"([cyan]{escape(_alt['path_claim'])}[/cyan]) "
+                                  f"en lugar de {res['confidence']} "
+                                  f"tmdb={res['tmdb']}")
+                    res = _alt
+        except Exception as e:
+            log.info(f"[id_resolver] path ids ignored: {e}")
+
         if res['confidence'] == 'high' and (res['tmdb'] or res['imdb']):
             self._apply_resolved(meta, res)
             if res.get('source') == 'override':
                 src = "saved override"
+            elif res.get('source') == 'path':
+                src = "id in path, verified on TMDB"
             else:
                 src = f"{res['votes'] or res['mal_votes']} providers agree"
             console.print(
@@ -3224,8 +3416,17 @@ class Prep():
             if each['id'] == 16:
                 animation = True
         if response['original_language'] == 'ja' and animation:
-            romaji, mal_id, eng_title, season_year, episodes = self.get_romaji(tmdb_name, meta.get('mal', None))
-            alt_name = f" AKA {romaji}"
+            anio = str(response.get('first_air_date') or response.get('release_date') or '')[:4]
+            romaji, mal_id, eng_title, season_year, episodes = self.get_romaji(tmdb_name, meta.get('mal', None), anio)
+            if meta.get('mal') in (None, 0, '0'):
+                # Con el Client ID del usuario, MAL confirma o corrige lo de
+                # AniList por el AÑO: «Captain Tsubasa» (1983) acababa en Road
+                # to 2002 (2001) porque los dos se llaman igual en algún idioma.
+                verificado = self._mal_por_anio(tmdb_name, anio)
+                if verificado and verificado[0] != mal_id:
+                    mal_id, romaji = verificado[0], verificado[1] or romaji
+            _n = lambda x: re.sub(r'[^0-9a-z]+', '', str(x or '').lower())
+            alt_name = f" AKA {romaji}" if romaji and _n(romaji) != _n(tmdb_name) else alt_name
             
             anime = True
             # mal = AnimeSearch(romaji)
@@ -3238,7 +3439,26 @@ class Prep():
             mal_id = meta.get('mal', 0)
         return mal_id, alt_name, anime
 
-    def get_romaji(self, tmdb_name, mal):
+    def _mal_por_anio(self, titulo, anio):
+        """(mal_id, romaji) del resultado de MAL del MISMO año con título equivalente, o None.
+
+        Solo con el Client ID del usuario (DEFAULT -> mal_client_id); sin él
+        no se consulta MAL (decisión del operador, 15-10-2026).
+        """
+        try:
+            from src.id_resolver import _mal_search, _mal_client_id
+        except ImportError:
+            return None
+        cliente = _mal_client_id(self.config.get('DEFAULT', {}))
+        if not cliente or not str(anio).isdigit():
+            return None
+        norma = lambda x: re.sub(r'[^0-9a-z]+', '', str(x or '').lower())
+        for c in _mal_search(titulo, cliente, lambda m: log.info(f"[mal] {m}")):
+            if c.get('year') == int(anio) and c.get('mal') and norma(titulo) in (norma(c.get('title')), norma(c.get('alt_title'))):
+                return int(c['mal']), c.get('alt_title') or c.get('title')
+        return None
+
+    def get_romaji(self, tmdb_name, mal, year=None):
         if mal is None:
             mal = 0
             tmdb_name = tmdb_name.replace('-', "").replace("The Movie", "")
@@ -3311,14 +3531,19 @@ class Prep():
                     if title is not None:
                         title = re.sub(u'[\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uff9f\u4e00-\u9faf\u3400-\u4dbf]+ (?=[A-Za-z ]+–)', "", title.lower().replace(' ', ''), re.U)
                         diff = SequenceMatcher(None, title, search_name).ratio()
-                        if diff >= difference:
+                        # Mismo año que TMDB: suma. Y a igualdad se queda el
+                        # primero (antes «>=» se quedaba el último: Road to
+                        # 2002 le ganaba a la Captain Tsubasa de 1983).
+                        if year and str(anime.get('seasonYear') or '') == str(year):
+                            diff += 0.05
+                        if diff > difference:
                             result = anime
                             difference = diff
 
             romaji = result['title'].get('romaji', result['title'].get('english', ""))
             mal_id = result.get('idMal', 0)
             eng_title = result['title'].get('english', result['title'].get('romaji', ""))
-            season_year = result.get('season_year', "")
+            season_year = result.get('seasonYear') or ""
             episodes = result.get('episodes', 0)
         else:
             romaji = eng_title = season_year  = ""
@@ -3616,7 +3841,21 @@ class Prep():
                 try:
                     source = guessit(path)['source']
                 except:
-                    source = "BluRay"
+                    # Ni el nombre ni la ruta lo dicen: antes era «BluRay» a
+                    # ciegas. Se deduce del mediainfo, como haría un admin.
+                    source, razones = self._origen_por_mediainfo(meta.get('mediainfo'))
+                    if source:
+                        console.print(f"[cyan]Origen deducido del mediainfo: {source} ({', '.join(razones)})[/cyan]")
+                    elif meta.get('unattended'):
+                        console.print("[bold yellow]⚠ No se sabe el origen (ni nombre, ni ruta, ni mediainfo): "
+                                      "se sube sin origen en el nombre.[/bold yellow]")
+                        source = ""
+                    else:
+                        console.print(f"[bold yellow]No se sabe el origen ({', '.join(razones)}).[/bold yellow]")
+                        source = Prompt.ask("¿Origen?", choices=["BluRay", "Web", "DVD", "HDTV"], default="Web")
+            if 'sdtv' in os.path.basename(video).lower() and type != "HDTV":
+                # get_type ya decidió que no es tele (ver «sdtv» allí).
+                source = self._origen_por_mediainfo(meta.get('mediainfo'))[0] or source
             if meta.get('manual_source', None):
                 source = meta['manual_source']
             if source in ("Blu-ray", "Ultra HD Blu-ray", "BluRay", "BR") or is_disc == "BDMV":
@@ -3652,7 +3891,9 @@ class Prep():
                     source = system
             if source in ("Web", "WEB"):
                 if type == "ENCODE":
-                    type = "WEBRIP"
+                    type = "WEBRIP" if self._recodificado_web(meta.get('mediainfo'), os.path.basename(video)) else "WEBDL"
+            if source == "HDTV" and type == "ENCODE":
+                type = "HDTV"
             if source in ("HD-DVD", "HD DVD", "HDDVD"):
                 if is_disc == "HDDVD":
                     source = "HD DVD"
@@ -4496,7 +4737,9 @@ class Prep():
         async with pyimgbox.Gallery(thumb_width=350, square_thumbs=False) as gallery:
             async for submission in gallery.add(image_glob):
                 if not submission['success']:
-                    console.print(f"[red]There was an error uploading to imgbox: [yellow]{submission['error']}[/yellow][/red]")
+                    # Una línea: con un 500 el error trae la página HTML entera.
+                    error = ' '.join(str(submission['error'])[:200].split())
+                    console.print(f"[red]There was an error uploading to imgbox: [yellow]{escape(error)}[/yellow][/red]")
                     return []
                 else:
                     image_dict = {}
@@ -4570,8 +4813,12 @@ class Prep():
                 console.log(f"YEAR: {meta['year']}") 
                 if meta.get('source'):          
                     console.log(f"SOURCE: {meta['source']}")
-            console.log("[cyan]get_name meta:")
-            console.log(meta)
+            # Solo los valores cortos: el meta entero lleva el mediainfo y llenaba
+            # la pantalla en cada subida en debug.
+            console.log("[cyan]get_name meta (valores cortos):")
+            # (Sin type(None): get_name tiene una variable local «type».)
+            console.log({k: v for k, v in meta.items()
+                         if (v is None or isinstance(v, (str, int, float, bool))) and len(str(v)) <= 120})
 
             
         # name_notag = ''
@@ -4783,7 +5030,7 @@ class Prep():
                     anime_title = parent_name if parent_name else grandparent_name
                 parsed['anime_title'] = anime_title
                 # romaji, mal_id, eng_title, seasonYear, anilist_episodes = self.get_romaji(guessit(parsed['anime_title'], {"excludes" : ["country", "language"]})['title'])
-                romaji, mal_id, eng_title, seasonYear, anilist_episodes = self.get_romaji(parsed['anime_title'], meta.get('mal', None))
+                romaji, mal_id, eng_title, seasonYear, anilist_episodes = self.get_romaji(parsed['anime_title'], meta.get('mal', None), parsed.get('anime_year'))
                 if mal_id:
                     meta['mal_id'] = mal_id
                 if meta.get('tmdb_manual', None) is None:

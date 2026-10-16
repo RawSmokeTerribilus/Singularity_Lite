@@ -146,6 +146,10 @@ class MILNU():
         
         if meta['debug']:
             self.logger.info(f"DATA 2 SEND: {data}")
+            # --debug promete ensayo: se enseña lo que se mandaría y no se manda.
+            # False hace que upload.py lo apunte como «(DEBUG MODE)», no como rechazo.
+            console.print(f"[bold yellow]DEBUG: no se sube a {self.tracker}.[/bold yellow]")
+            return False
 
         return_value = False # Default return value
         try:
@@ -200,12 +204,10 @@ class MILNU():
                             self.logger.error(f"HTTP {response.status_code}: {error_heading.text.strip()}")
                         else:
                             console.print(f"[red]Encountered HTTP Error: {response.status_code}[/red]")
-                            console.print(f"[blue]Server Response[/blue]: {response.text}")
-                            self.logger.error(f"HTTP {response.status_code} - Could not parse response, raw text below")
-                            self.logger.error(response.text) # Log raw text if not parsed
+                            self._volcar_respuesta(meta, response)
                     except Exception as parse_error:
                         console.print(f"[red]Failed to parse error response: {parse_error}[/red]")
-                        console.print(f"[blue]Server Response[/blue]: {response.text}")
+                        self._volcar_respuesta(meta, response)
                         self.logger.error(f"Failed to parse error response: {str(parse_error)}")
                     
                     return_value = False # Explicitly return False
@@ -238,6 +240,22 @@ class MILNU():
             self.logger.warning(f"Failed to close torrent file: {str(e)}")
 
         return return_value
+
+    def _volcar_respuesta(self, meta, response):
+        """Una línea en pantalla y en el log; la respuesta entera, a un fichero.
+
+        Antes salía la página HTML completa (login, error 500...) en pantalla y
+        en el log, una vez por intento.
+        """
+        inicio = ' '.join(response.text[:300].split())
+        try:
+            ruta = f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}]respuesta_HTTP{response.status_code}.html"
+            with open(ruta, 'w', encoding='utf-8') as f:
+                f.write(response.text)
+        except (OSError, KeyError):
+            ruta = '(no se pudo guardar)'
+        console.print(f"[blue]Server Response[/blue]: {inicio}… [dim](entera en {ruta})[/dim]")
+        self.logger.error(f"HTTP {response.status_code}: {inicio}… (entera en {ruta})")
 
     async def search_existing(self, meta):
         dupes = {}
@@ -272,9 +290,11 @@ class MILNU():
                     self.logger.info(f"Dupe search found {len(dupes)} results")
                     break  # Success, exit retry loop
                 except json.JSONDecodeError:
-                    self.logger.error("Failed to decode JSON from response. Response text:")
-                    self.logger.error(response.text)
+                    # Una línea, no la página entera (suele ser el HTML del login).
+                    inicio = ' '.join(response.text[:200].split())
+                    self.logger.error(f"Dupe search: HTTP {response.status_code}, no es JSON: {inicio}")
                     console.print('[bold red]Unable to search for existing torrents on site. Either the site is down or your API key is incorrect')
+                    meta['dupe_busqueda_fallida'] = self.tracker
                     break
 
             except requests.exceptions.Timeout:
@@ -285,10 +305,14 @@ class MILNU():
                 else:
                     console.print('[bold yellow]Timeout: Proceeding without dupe check')
                     self.logger.warning("Skipping dupe check due to repeated timeouts")
-                    
+                    meta['dupe_busqueda_fallida'] = self.tracker
+
             except Exception as e:
                 console.print('[bold red]Unable to search for existing torrents on site. Either the site is down or your API key is incorrect')
-                self.logger.error(f"Dupe search error: {str(e)}")
+                # El texto de una excepción de requests lleva la URL con la api_token.
+                motivo = type(e).__name__ if isinstance(e, requests.exceptions.RequestException) else f"{type(e).__name__}: {e}"
+                self.logger.error(f"Dupe search error: {motivo}")
+                meta['dupe_busqueda_fallida'] = self.tracker
                 break
         
         return dupes

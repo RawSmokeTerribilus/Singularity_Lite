@@ -51,7 +51,7 @@ try:
 except ImportError:
     pass
 
-from singularity_config import GOD_PHRASES, MSG_NUEVO, ID_INICIO, ID_FIN, LOGS_DIR, BASE_URL, COOKIE_VALUE, IMGBB_API, PTSCREENS_API  # noqa: F401 – BASE_URL/COOKIE_VALUE/IMGBB_API/PTSCREENS_API usados en _ensure_credentials (SING_* namespace)
+from singularity_config import GOD_PHRASES, MSG_NUEVO, ID_INICIO, ID_FIN, LOGS_DIR
 
 console = Console()
 
@@ -391,6 +391,41 @@ def _me_load_rl_trackers() -> dict:
         return {}
 
 
+def _me_cookie_estado(me_cfg: dict) -> str:
+    """'valida', 'caducada' o 'desconocido' (sin URL, sin nombre o sin red: no se molesta)."""
+    url, nombre, valor = (me_cfg.get("tracker_url") or "").rstrip("/"), me_cfg.get("cookie_name"), me_cfg.get("cookie")
+    if not (url and nombre and valor):
+        return "desconocido"
+    try:
+        import requests
+        r = requests.get(f"{url}/torrents", cookies={nombre: valor}, timeout=15, allow_redirects=True,
+                         headers={"User-Agent": me_cfg.get("user_agent") or "Mozilla/5.0"})
+    except Exception:
+        return "desconocido"
+    if (r.history and r.url.split("?")[0].rstrip("/").endswith("/login")) \
+            or re.search(r'<form[^>]+action="[^"]*login|name="password"', r.text[:200000]):
+        return "caducada"
+    return "valida" if r.status_code == 200 else "desconocido"
+
+
+def _me_valor_cookie(raw: str, nombre: str) -> str:
+    """Vale el valor o la cabecera «Cookie» entera: de ésta se saca la de sesión."""
+    raw = re.sub(r"^\s*cookie\s*:\s*", "", raw, flags=re.I).strip().strip('"')
+    pares = [p.strip().split("=", 1) for p in raw.split(";") if "=" in p and not p.strip().startswith("eyJ")]
+    for n, v in pares:
+        if n.strip() == nombre or (not nombre and n.strip().endswith("_session")):
+            return v.strip()
+    return raw
+
+
+def _me_guardar_cookie(me_cfg: dict, valor: str) -> None:
+    """Donde ya guarda su Settings: la compartida y la del tracker (la que usan 05/06)."""
+    _write_env_key("ME_TRACKER_COOKIE", valor)
+    abrev = (me_cfg.get("tracker_name") or "").strip().upper()
+    if abrev:
+        _write_env_key(f"TRACKER_{abrev}_COOKIE_VALUE", valor)
+
+
 def _me_check_essential_config(me_cfg: dict) -> dict:
     """Aduana de arranque: valida los campos obligatorios de Mass Edition (al estilo CSI)."""
     changed = False
@@ -403,13 +438,28 @@ def _me_check_essential_config(me_cfg: dict) -> dict:
             me_cfg["tracker_url"] = val
             changed = True
 
-    if not me_cfg.get("cookie"):
-        console.print("\n[bold red]ME_TRACKER_COOKIE (sesión) no configurada.[/bold red]")
-        val = Prompt.ask("Cookie de sesión", password=True).strip()
-        if val:
-            _write_env_key("ME_TRACKER_COOKIE", val)
-            me_cfg["cookie"] = val
-            changed = True
+    # La cookie se comprueba (como en CSI): antes solo se miraba que hubiera
+    # una, y una caducada no se veía hasta que el editor moría a medias.
+    estado = _me_cookie_estado(me_cfg) if me_cfg.get("cookie") else "falta"
+    if estado in ("falta", "caducada"):
+        console.print("\n[bold red]" + ("ME_TRACKER_COOKIE (sesión) no configurada." if estado == "falta"
+                      else "La cookie de sesión de Mass Edition no vale: el tracker manda al login.") + "[/bold red]")
+        console.print(f"[dim]Navegador con la sesión iniciada en {me_cfg.get('tracker_url') or 'el tracker'} → F12 → "
+                      f"Almacenamiento → Cookies → valor de «{me_cfg.get('cookie_name') or '…_session'}».[/dim]")
+        while True:
+            val = Prompt.ask("Cookie de sesión [dim](Enter para seguir sin cambiarla)[/dim]", password=True, default="").strip()
+            if not val:
+                break
+            val = _me_valor_cookie(val, me_cfg.get("cookie_name") or "")
+            if _me_cookie_estado(dict(me_cfg, cookie=val)) != "caducada":
+                _me_guardar_cookie(me_cfg, val)
+                me_cfg["cookie"] = val
+                changed = True
+                console.print(f"[green]✓ Cookie guardada[/green] [dim]({len(val)} caracteres)[/dim]")
+                break
+            console.print("[yellow]⚠ Esa tampoco abre sesión (el tracker manda al login).[/yellow]")
+            if Prompt.ask("¿Probar otra vez?", choices=["s", "n"], default="s") == "n":
+                break
 
     tmp = me_cfg.get("tmp_root", "")
     if not tmp or not os.path.exists(tmp):
@@ -1120,112 +1170,6 @@ def _singularity_summary(results: dict, elapsed_total: float):
         border_style="cyan",
         padding=(1, 2),
     ))
-
-
-def _ensure_credentials(need_unit3d: bool) -> None:
-    """Prompt for any credentials that are missing from the environment."""
-    env_path = BASE_DIR / ".env"
-
-    _creds: list[tuple[str, str, str, bool]] = [
-        (
-            "SING_TRACKER_URL",
-            "La URL base del tracker para el pipeline de Singularidad (ej: https://mitracker.com)",
-            BASE_URL,
-            need_unit3d,
-        ),
-        (
-            "SING_TRACKER_COOKIE",
-            "La cookie de sesión del tracker para el pipeline de Singularidad\n"
-            "  → F12 → Application → Cookies → copia el valor de la sesión",
-            COOKIE_VALUE,
-            need_unit3d,
-        ),
-        (
-            "SING_IMGBB_API",
-            "La API Key de ImgBB para el pipeline de Singularidad",
-            IMGBB_API,
-            need_unit3d,
-        ),
-        (
-            "SING_PTSCREENS_API",
-            "La API Key de PTScreens para el pipeline de Singularidad",
-            PTSCREENS_API,
-            need_unit3d,
-        ),
-        (
-            "SONARR_API_KEY",
-            "La API Key de Sonarr (opcional, para indexar)\n"
-            "  → Settings -> General -> API Key",
-            os.getenv("SONARR_API_KEY", ""),
-            False,
-        ),
-        (
-            "SONARR_URL",
-            "La URL de Sonarr (ej: http://localhost:8989)",
-            os.getenv("SONARR_URL", "http://127.0.0.1:8989"),
-            False,
-        ),
-        (
-            "RADARR_API_KEY",
-            "La API Key de Radarr (opcional, para indexar)\n"
-            "  → Settings -> General -> API Key",
-            os.getenv("RADARR_API_KEY", ""),
-            False,
-        ),
-        (
-            "RADARR_URL",
-            "La URL de Radarr (ej: http://localhost:7878)",
-            os.getenv("RADARR_URL", "http://127.0.0.1:7878"),
-            False,
-        ),
-        (
-            "TMP_ROOT",
-            "Carpeta temporal para el curro",
-            os.getenv("TMP_ROOT", str(BASE_DIR / "tmp")),
-            False,
-        ),
-    ]
-
-    missing = [(env_key, desc, cur) for env_key, desc, cur, required in _creds if required and not cur]
-    if not missing:
-        return
-
-    console.print()
-    console.print(Panel(
-        "[yellow]Ojo, que faltan credenciales para poder arrancar el pipeline.\n"
-        "Te las pediré ahora. Puedes guardarlas en el archivo .env\n"
-        "para no dar la brasa otra vez.[/yellow]",
-        title="[bold yellow]⚠ A rellenar credenciales[/bold yellow]",
-        border_style="yellow",
-    ))
-
-    new_vals: dict[str, str] = {}
-    for env_key, desc, _ in missing:
-        console.print(f"\n[bold cyan]{env_key}[/bold cyan]")
-        console.print(f"[dim]{desc}[/dim]")
-        val = Prompt.ask(f"[bold]Mete el valor[/bold]", password=("COOKIE" in env_key or "KEY" in env_key)).strip()
-        os.environ[env_key] = val
-        new_vals[env_key] = val
-
-    if new_vals:
-        save = Prompt.ask(
-            "\n¿Te guardo estas credenciales en el .env para no dar la brasa otra vez?",
-            choices=["s", "n"],
-            default="s",
-        )
-        if save == "s":
-            existing: dict[str, str] = {}
-            if env_path.exists():
-                for line in env_path.read_text().splitlines():
-                    line = line.strip()
-                    if "=" in line and not line.startswith("#"):
-                        k, _, v = line.partition("=")
-                        existing[k.strip()] = v.strip()
-            existing.update(new_vals)
-            with open(env_path, "w") as fh:
-                for k, v in existing.items():
-                    fh.write(f"{k}={v}\n")
-            console.print("[green]✓ ¡Ale! Credenciales guardadas en el .env[/green]")
 
 
 def singularity_mode():

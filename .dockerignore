@@ -27,6 +27,7 @@ Executive_resume.md
 docs/
 mkdocs.yml
 **/*.bkp
+**/*.bak*
 
 # --- SCRIPTS DE CONTROL DEL HOST ---
 .dockerignore
@@ -38,3 +39,14 @@ makefile
 extras/MASS-EDITION-UNIT3D/archive/
 **/MASS-EDITION-UNIT3D/archive/
 **/*.tsv
+
+# --- ESTADO DE EJECUCIÓN DEL REPO DE DEV ---
+# work_data/ es el estado vivo de quien construye (logs, temporales, informes,
+# datos del editor masivo). Las carpetas se quedan --/app/work_data/tmp es la
+# caché de universal_rescuer.py y reports/ un punto de montaje--, su contenido
+# no: rc1 se publicó con lo que hubiera ahí (por suerte, nada sensible).
+work_data/tmp/*
+work_data/logs/*
+work_data/reports/*
+work_data/mass_editor/*
+work_data/cookies*

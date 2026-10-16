@@ -19,6 +19,9 @@ config = {'AUTO': {'delay': 0, 'description_folder': None, 'dupe_similarity': 80
              'igdb_client_id': 'TWITCH_CLIENT_ID',
              'igdb_client_secret': 'TWITCH_CLIENT_SECRET',
              'imdb_api': 'IMDB_API',
+             # Client ID de una app de MyAnimeList (myanimelist.net/apiconfig).
+             # Sin él, el anime se identifica solo con AniList.
+             'mal_client_id': 'MAL_CLIENT_ID',
              # Cascada de hosts de imágenes: se prueba img_host_1, y si falla se
              # pasa al siguiente. Elige hosts con API key y cuenta propia: si el
              # host muere, se lleva por delante TODAS las galerías que subiste
@@ -84,7 +87,7 @@ config = {'AUTO': {'delay': 0, 'description_folder': None, 'dupe_similarity': 80
                                  'qbit_user': 'USERNAME',
                                  'torrent_client': 'qbit'},
                      'deluge': {'deluge_pass': 'PASSWORD',
-                                'deluge_port': '8080',
+                                'deluge_port': '58846',
                                 'deluge_url': 'localhost',
                                 'deluge_user': 'USERNAME',
                                 'torrent_client': 'deluge'},
@@ -92,7 +95,7 @@ config = {'AUTO': {'delay': 0, 'description_folder': None, 'dupe_similarity': 80
                               'content_layout': 'Original',
                               'enable_search': True,
                               'qbit_pass': 'PASSWORD',
-                              'qbit_port': '8888',
+                              'qbit_port': '8080',
                               'qbit_url': 'http://127.0.0.1',
                               'qbit_user': 'USERNAME',
                               'torrent_client': 'qbit',
@@ -750,7 +753,7 @@ config = {'AUTO': {'delay': 0, 'description_folder': None, 'dupe_similarity': 80
  #
  #  2. 'qbit_url' va SIN puerto, porque el puerto se pasa aparte en
  #     'qbit_port'. Si lo pones en los dos sitios el log escribe
- #     http://127.0.0.1:8888:8888, que asusta pero es SOLO cosmético:
+ #     http://127.0.0.1:8080:8080, que asusta pero es SOLO cosmético:
  #     qbittorrent-api usa el puerto de la URL e ignora el parámetro
  #     redundante, y conecta igual (así lleva años corriendo en producción).
  #     Se deja sin puerto por coherencia con el asistente, que pregunta la
@@ -758,7 +761,7 @@ config = {'AUTO': {'delay': 0, 'description_folder': None, 'dupe_similarity': 80
  #     conexión, NO es la causa: mira las credenciales.
  'qbit': {'enable_search': True,
           'qbit_pass': 'PASSWORD',
-          'qbit_port': '8888',
+          'qbit_port': '8080',
           'qbit_url': 'http://127.0.0.1',
           'qbit_user': 'YOUR_USERNAME',
           'torrent_storage_dir': '/app/RawLoadrr/qbit_backup'},

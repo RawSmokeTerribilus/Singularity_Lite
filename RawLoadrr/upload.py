@@ -24,6 +24,7 @@ from src.logger import set_debug_mode as set_upload_logger_debug_mode
 from rich.markdown import Markdown
 from rich.style import Style
 from rich.prompt import Prompt, Confirm
+from rich.markup import escape
 from rich.text import Text
 from rich.panel import Panel
 from rich.table import Table
@@ -533,7 +534,7 @@ async def do_the_thing(base_dir):
         if os.path.exists(root_path):
             if os.path.isdir(root_path):
                 console.print(Rule("[bold green]RECURSIVE SCAN INITIATED[/bold green]", style="green"))
-                console.print(f"[dim]Scanning:[/dim] [cyan]{root_path}[/cyan]")
+                console.print(f"[dim]Scanning:[/dim] [cyan]{escape(str(root_path))}[/cyan]")
                 only = _resolver_only(meta, root_path)
                 if only is None:
                     return
@@ -839,8 +840,11 @@ async def do_the_thing(base_dir):
                             download_url_from_tracker = upload_success.get('data')
                             
                             if download_url_from_tracker and download_url_from_tracker.startswith('http'):
-                                console.print(f"[bold yellow]Download URL Detectado: {download_url_from_tracker}. Descargando versión oficial del tracker...")
-                                tracker_class.logger.info(f"Downloading regenerated torrent from: {download_url_from_tracker}")
+                                # /torrent/download/<id>.<rsskey>: la rsskey es un secreto
+                                # (con ella se descarga como el usuario); se enseña el id.
+                                url_visible = re.sub(r'(/download/\d+)\.[0-9a-fA-F]+', r'\1.…', download_url_from_tracker)
+                                console.print(f"[bold yellow]Download URL Detectado: {url_visible}. Descargando versión oficial del tracker...")
+                                tracker_class.logger.info(f"Downloading regenerated torrent from: {url_visible}")
                                 
                                 # Ruta del archivo torrent local que vamos a sobreescritura
                                 torrent_path_to_overwrite = f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}]{meta['clean_name']}.torrent"
@@ -1184,11 +1188,14 @@ async def do_the_thing(base_dir):
         return formatted_text
 
     if total_files > 0:
+        # Un ensayo con --debug no es un fallo: se cuenta aparte.
+        ensayos = sum(1 for _, motivo in skipped_details if str(motivo).endswith("(DEBUG MODE)"))
         console.print()
         console.print(Panel(
             f"Processed [bold bright_magenta]{total_files}[/bold bright_magenta] Unique Uploads\n"
             f"Successful Uploads: [bold green]{successful_uploads}[/bold green]\n"
-            f"Failed Uploads: [bold red]{skipped_files}[/bold red]",
+            + (f"Ensayos (--debug, sin subir): [bold yellow]{ensayos}[/bold yellow]\n" if ensayos else "")
+            + f"Failed Uploads: [bold red]{skipped_files - ensayos}[/bold red]",
             title="[bold]SESSION REPORT[/bold]",
             border_style="bold cyan",
             box=box.HEAVY
@@ -1357,11 +1364,22 @@ def get_confirmation(meta):
     return confirm
 
 def dupe_check(dupes, meta, config, skipped_details, path):
+    # Lo marcan los módulos de la casa cuando la búsqueda falla; pop para que
+    # no se arrastre al siguiente tracker.
+    fallida = meta.pop('dupe_busqueda_fallida', None)
     if meta.get('dupe', False):
         console.print("[yellow]Skipping duplicate check as requested.")
         meta['upload'] = True   
         return meta, False  # False indicates not skipped
     
+    if fallida:
+        # Decisión del operador (15-10-2026): se sube igual, el tracker
+        # rechaza los duplicados. Lo que no se hace es afirmar que no los hay.
+        console.print(f"[bold yellow]⚠️  No se pudo comprobar si hay duplicados en {fallida}: se sube igual "
+                      f"(el tracker rechaza los duplicados).[/bold yellow]")
+        meta['upload'] = True
+        return meta, False
+
     if not dupes:
         console.print("[bold green]✓ No duplicates found[/bold green]")
         meta['upload'] = True   

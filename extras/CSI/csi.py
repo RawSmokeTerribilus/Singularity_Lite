@@ -456,7 +456,15 @@ def load_config() -> dict:
 
     # qBit: Default to localhost:8888 for Network Agnosticism
     rl_qbit  = rl_cfg.get("TORRENT_CLIENTS", {}).get("qbit", {})
-    qbit_url  = _env("QBIT_URL") or f"http://{rl_qbit.get('qbit_url','localhost')}:{rl_qbit.get('qbit_port','8888')}"
+    # La URL de RawLoadrr ya trae «http://» (y a veces el puerto): pegarle otro
+    # daba «http://http://127.0.0.1:58846» en una instalación nueva.
+    _rq_url  = str(rl_qbit.get('qbit_url') or 'localhost').rstrip('/')
+    _rq_port = str(rl_qbit.get('qbit_port') or '8080')
+    if not re.match(r'^https?://', _rq_url):
+        _rq_url = f"http://{_rq_url}"
+    if not re.search(r':\d+$', _rq_url.split('//', 1)[1]):
+        _rq_url = f"{_rq_url}:{_rq_port}"
+    qbit_url  = _env("QBIT_URL") or _rq_url
     
     # CSI v1.6.4: Strict No-host.docker.internal policy
     if "host.docker.internal" in qbit_url:
@@ -1959,7 +1967,10 @@ class TrackerIndex:
                 dbg("Scraper: safety limit reached (500 pages)")
                 break
                 
-            url = f"{base}/torrents?uploader={user}&page={page}"
+            # view=list: el scraper lee las filas de la vista de lista, y UNIT3D
+            # solo aplica la vista guardada del usuario (tarjetas, agrupada,
+            # pósters) si la URL no trae «view». En NOBS 16 cuentas usan otra.
+            url = f"{base}/torrents?uploader={user}&page={page}&view=list"
             try:
                 api_limiter.wait()
                 r = sess.get(url, timeout=20)
@@ -2829,7 +2840,7 @@ def _scraper_search_item(config: dict, tmdb_id=None, tvdb_id=None,
     try:
         sess = _session(config)
         search_term = query or ""
-        url = f"{base}/torrents?tmdbId={tmdb_id or ''}&name={search_term}&page=1"
+        url = f"{base}/torrents?tmdbId={tmdb_id or ''}&name={search_term}&page=1&view=list"
         dbg(f"[SCRAPER_FALLBACK] HTTP scrape: {url}")
         api_limiter.wait()
         r = sess.get(url, timeout=15)
@@ -3734,11 +3745,16 @@ def configure_tracker(config: dict) -> dict:
             name = Prompt.ask("Tracker ID", default=config.get("TRACKER_DEFAULT") or "NOBS")
             url = Prompt.ask("Base URL", default=config.get("TRACKER_URL") or "")
             user = Prompt.ask("Username", default=config.get("TRACKER_USERNAME") or "")
-            api_key = Prompt.ask("API Key", default=config.get("TRACKER_API_KEY") or "")
+            # Sin enseñar la clave guardada: Enter la deja como está.
+            api_key = Prompt.ask("API Key [dim](Enter para no cambiarla)[/dim]", password=True,
+                                 default="").strip() or (config.get("TRACKER_API_KEY") or "")
             
-            # Cookie handling v1.6.2
-            old_cookie = config.get("TRACKER_COOKIE") or config.get("TRACKER_COOKIE_VALUE") or ""
-            cookie_val = Prompt.ask("TRACKER_COOKIE (Session Value)", default=old_cookie)
+            # La cookie, con la misma rutina que el arranque: se comprueba
+            # contra la URL nueva antes de guardarla; Enter deja la que hay.
+            _ok, _ = validate_cookie(dict(config, TRACKER_URL=url))
+            console.print("[green]La cookie actual abre sesión.[/green]" if _ok
+                          else "[yellow]La cookie actual no abre sesión.[/yellow]")
+            got = _pedir_cookie(dict(config, TRACKER_URL=url, TRACKER_DEFAULT=name.strip().upper()))
             
             n = name.strip().upper()
             save_config("TRACKER_DEFAULT", n)
@@ -3747,15 +3763,12 @@ def configure_tracker(config: dict) -> dict:
             save_config("TRACKER_USERNAME", user)
             save_config("TRACKER_API_KEY", api_key)
             save_config(f"TRACKER_{n}_API_KEY", api_key)
-            save_config("TRACKER_COOKIE", cookie_val)
-            save_config("TRACKER_COOKIE_VALUE", cookie_val)
             
             # Propagar cambios
             updates = {
                 "TRACKER_DEFAULT": n,
                 "TRACKER_URL": url,
                 "TRACKER_USERNAME": user,
-                "TRACKER_COOKIE_VALUE": cookie_val
             }
             
             # Pedir Announce URL para RawLoadrr
@@ -3765,6 +3778,8 @@ def configure_tracker(config: dict) -> dict:
             
             _propagate_config(updates)
             config = load_config()
+            if got:
+                config = _guardar_cookie(config, *got)
 
         elif c == "3":
             new_tmp = Prompt.ask("Enter TMP path", default=config["TMP_PATH"])
@@ -3815,49 +3830,114 @@ def configure_tracker(config: dict) -> dict:
                 config = load_config()
 
 def _detect_auth_failure(soup: BeautifulSoup) -> bool:
-    """CSI v3.1: Detecta si una página UNIT3D es un login page en vez de contenido.
-    UNIT3D devuelve HTTP 200 con login page para cookies expiradas."""
-    # Indicadores explícitos de login page
-    if soup.select("form[action*=login]") or soup.select("input[name=password]"):
-        return True
-    # Ausencia total del contenedor de lista de torrents
-    if not soup.select(".torrent-search") and not soup.select("table.table") and not soup.select("tr.torrent-search--list__row"):
-        return True
-    return False
+    """¿Es la página de login? Solo por el formulario de login.
+
+    Antes también contaba como «login» una página SIN lista de torrents, y
+    eso es justo lo que devuelve /torrents?uploader=USUARIO a quien tiene 0
+    subidas o el usuario vacío o mal escrito: CSI pedía una cookie que valía.
+    """
+    return bool(soup.select("form[action*=login]") or soup.select("input[name=password]"))
 
 
 def validate_cookie(config: dict) -> tuple:
-    """CSI v3.1: Valida la cookie del tracker con inspección de contenido.
-    Retorna (is_valid: bool, reason: str)."""
+    """¿Abre sesión la cookie? Retorna (is_valid: bool, reason: str).
+
+    Se pregunta a la portada de torrents sin filtros y se mira la SESIÓN (si
+    acaba en /login o enseña el formulario), no si hay torrents.
+    """
     if not config.get("TRACKER_URL") or not (config.get("TRACKER_COOKIE") or config.get("TRACKER_COOKIE_VALUE")):
         return False, "No hay cookie configurada"
 
     base = config["TRACKER_URL"].rstrip("/")
-    user = config.get("TRACKER_USERNAME", "")
     sess = _session(config)
     try:
-        url = f"{base}/torrents"
-        if user:
-            url = f"{base}/torrents?uploader={user}&page=1"
-        r = sess.get(url, timeout=15, allow_redirects=True)
-
-        if r.status_code != 200:
-            reason = f"HTTP {r.status_code}"
-            dbg(f"Cookie validation failed: {reason}")
-            return False, reason
-
-        # Inspeccionar contenido — UNIT3D devuelve 200 con login page para cookies expiradas
-        soup = BeautifulSoup(r.text, "html.parser")
-        if _detect_auth_failure(soup):
-            reason = "Cookie expirada — el tracker devuelve página de login"
-            dbg(f"Cookie validation failed: {reason}")
-            return False, reason
-
-        return True, "OK"
+        r = sess.get(f"{base}/torrents", timeout=15, allow_redirects=True)
     except Exception as e:
-        reason = f"Error de conexión: {e}"
+        reason = f"Error de conexión: {type(e).__name__}"
         dbg(f"Cookie validation error: {reason}")
         return False, reason
+
+    if r.history and r.url.split("?")[0].rstrip("/").endswith("/login"):
+        reason = "el tracker redirige al login (sesión caducada o cookie que no es la de sesión)"
+        dbg(f"Cookie validation failed: {reason}")
+        return False, reason
+    if r.status_code != 200:
+        reason = f"HTTP {r.status_code}"
+        dbg(f"Cookie validation failed: {reason}")
+        return False, reason
+    if _detect_auth_failure(BeautifulSoup(r.text, "html.parser")):
+        reason = "el tracker devuelve la página de login"
+        dbg(f"Cookie validation failed: {reason}")
+        return False, reason
+    return True, "OK"
+
+
+def _extraer_cookie(raw: str, nombre: str) -> tuple:
+    """Lo pegado -> (nombre, valor). Vale el VALOR de la cookie de sesión o la
+    cabecera «Cookie» entera, de la que se saca la de sesión."""
+    raw = re.sub(r"^\s*cookie\s*:\s*", "", raw or "", flags=re.I).strip().strip('"')
+    if raw.startswith("eyJ") or "=" not in raw.split(";")[0][:120]:
+        return None, raw                       # un valor suelto
+    pares = [p.strip().split("=", 1) for p in raw.split(";") if "=" in p]
+    for n, v in pares:
+        if n.strip() == nombre:
+            return n.strip(), v.strip()
+    for n, v in pares:
+        if n.strip().endswith("_session"):
+            return n.strip(), v.strip()
+    return None, raw
+
+
+def _pedir_cookie(config: dict) -> Optional[tuple]:
+    """Pide la cookie, la COMPRUEBA antes de guardarla y deja repetir.
+
+    Devuelve (nombre, valor) de una cookie que abre sesión, o None si el
+    usuario lo deja (Enter vacío o «no» al reintento).
+    """
+    nombre = config.get("TRACKER_COOKIE_NAME") or "…_session"
+    console.print(
+        f"[dim]Navegador con la sesión iniciada en {config.get('TRACKER_URL') or 'el tracker'} → F12 →\n"
+        f"Almacenamiento (Application) → Cookies → copia el valor de [bold]{nombre}[/bold].\n"
+        "También vale la cabecera «Cookie» entera de Red → Cabeceras de la petición.[/dim]"
+    )
+    while True:
+        raw = Prompt.ask("Cookie de sesión [dim](Enter para dejarlo)[/dim]", password=True, default="").strip()
+        if not raw:
+            return None
+        n, v = _extraer_cookie(raw, nombre)
+        n = n or config.get("TRACKER_COOKIE_NAME")
+        ok, why = validate_cookie(dict(config, TRACKER_COOKIE=v, TRACKER_COOKIE_VALUE=v, TRACKER_COOKIE_NAME=n))
+        if ok:
+            console.print(f"[bold green]✓ Cookie válida[/bold green] [dim]({n}, {len(v)} caracteres)[/dim]")
+            return n, v
+        console.print(f"[bold yellow]⚠ No abre sesión: {why}.[/bold yellow] "
+                      f"[dim]Llegaron {len(raw)} caracteres; se probó como «{n}».[/dim]")
+        if not Confirm.ask("¿Probar otra vez?", default=True):
+            return None
+
+
+def _guardar_cookie(config: dict, nombre: Optional[str], valor: str) -> dict:
+    """Un solo sitio para guardar la cookie: lo usan el arranque y Settings.
+
+    Antes cada camino escribía un subconjunto distinto de las claves (y había
+    más aduanas pidiendo la misma cookie): el arranque «no funcionaba» y
+    Settings sí. Se escriben todas las de CSI, y las de Mass Edition si apunta
+    al mismo tracker.
+    """
+    abrev = (config.get("TRACKER_DEFAULT") or "").strip().upper()
+    for k in ("TRACKER_COOKIE", "TRACKER_COOKIE_VALUE") + ((f"TRACKER_{abrev}_COOKIE_VALUE",) if abrev else ()):
+        save_config(k, valor)
+    if nombre:
+        for k in ("TRACKER_COOKIE_NAME",) + ((f"TRACKER_{abrev}_COOKIE_NAME",) if abrev else ()):
+            save_config(k, nombre)
+    me_url = (os.getenv("ME_TRACKER_URL") or "").rstrip("/")
+    if me_url and me_url == (config.get("TRACKER_URL") or "").rstrip("/"):
+        save_config("ME_TRACKER_COOKIE", valor)
+        if nombre:
+            save_config("ME_TRACKER_COOKIE_NAME", nombre)
+    _propagate_config({"TRACKER_COOKIE_VALUE": valor})
+    return load_config()
+
 
 def validate_qbit(config: dict) -> bool:
     """Test connectivity to qBittorrent."""
@@ -3998,18 +4078,13 @@ def check_essential_config(config: dict) -> dict:
     needs_save = False
     updates = {}
     
-    # 1. Tracker Cookie
-    cookie = config.get("TRACKER_COOKIE") or config.get("TRACKER_COOKIE_VALUE")
+    # 1. Tracker Cookie: solo se pide si de verdad no abre sesión.
     _cookie_valid, _cookie_reason = validate_cookie(config)
-    if not cookie or not _cookie_valid:
-        console.print("[bold red]TRACKER_COOKIE missing or expired![/bold red]")
-        new_cookie = Prompt.ask("Enter your tracker session cookie", default=cookie or "")
-        if new_cookie:
-            save_config("TRACKER_COOKIE", new_cookie)
-            save_config("TRACKER_COOKIE_VALUE", new_cookie)
-            config["TRACKER_COOKIE"] = new_cookie
-            needs_save = True
-            updates["TRACKER_COOKIE_VALUE"] = new_cookie
+    if not _cookie_valid:
+        console.print(f"[bold red]La cookie del tracker no vale: {_cookie_reason}.[/bold red]")
+        got = _pedir_cookie(config)
+        if got:
+            config = _guardar_cookie(config, *got)
 
     # 2. qBittorrent
     if not validate_qbit(config):
